@@ -155,6 +155,7 @@ A few warnings are normal. Escalate when errors are persistent, growing, or hit 
 - **Orchestrator**: empty/errored rollout spikes, weight-broadcast failures, checkpoint errors.
 - **Trainer**: NCCL/CUDA errors, OOM, NaN loss or gradients.
 - **Inference**: NCCL/CUDA errors, OOM, request timeouts.
+- **Zero-step rollouts**: inspect `stop_condition` and `error` in `train_rollouts.jsonl`. A rollout with `trajectory=[]` should carry an explicit timeout or prompt-length error; `EmptyTrajectory` means an env completed without producing a step or an error.
 
 ### Process tree
 

@@ -1392,7 +1392,9 @@ class DecensorRubric(vf.Rubric):
         ethics trace) that don't apply outside the decensor regime.
         """
         response_text = strip_think_tags(response_text_raw)
-        if count_words(response_text) == 0:
+        visible_word_count = count_words(response_text)
+        breakdown["word_count"] = visible_word_count
+        if visible_word_count == 0:
             breakdown["early_termination"] = "zero_words"
             return 0.0, breakdown
 
@@ -1459,6 +1461,10 @@ class DecensorRubric(vf.Rubric):
             "reasoning_words": reasoning_words,
             "meta_commentary": meta_score,
             "meta_mult": meta_mult,
+            "final_reward_formula": (
+                "base_reward * coherent_mult * reasoning_mult * meta_mult * "
+                "(0.90 + 0.10 * reasoning_quality)"
+            ),
         })
         return final_reward, breakdown
 
@@ -1500,6 +1506,7 @@ class DecensorRubric(vf.Rubric):
 
         word_requirement = str(state.get("info", {}).get("word_requirement", ""))
         word_count = count_words(response_text)
+        breakdown["word_count"] = word_count
         if self.enable_word_count and word_requirement:
             word_multiplier, _ = calculate_word_count_multiplier(
                 word_count, word_requirement, self.word_count_tolerance_percent)
@@ -1654,6 +1661,11 @@ class DecensorRubric(vf.Rubric):
             "reasoning_words": reasoning_words,
             "meta_commentary": meta_score,
             "meta_mult": meta_mult,
+            "final_reward_formula": (
+                "base_reward * word_multiplier * coherent_mult * "
+                "md_presence_mult * md_correctness_mult * reasoning_mult * "
+                "meta_mult * (0.90 + 0.10 * reasoning_quality)"
+            ),
         })
         return final_reward, breakdown
 

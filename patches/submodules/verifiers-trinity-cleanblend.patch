@@ -1,3 +1,71 @@
+diff --git a/tests/test_multiturn_env.py b/tests/test_multiturn_env.py
+index 563eab05..74d91821 100644
+--- a/tests/test_multiturn_env.py
++++ b/tests/test_multiturn_env.py
+@@ -1,10 +1,12 @@
+ """Tests for the MultiTurnEnv class."""
+ 
+ import asyncio
++from unittest.mock import AsyncMock
+ 
+ import pytest
+ from datasets import Dataset
+ 
++import verifiers as vf
+ from verifiers import Messages, MultiTurnEnv, Parser, Rubric, State, stop
+ 
+ 
+@@ -253,6 +255,7 @@ class TestMultiTurnEnv:
+         assert state["stop_condition"] == "timeout_reached"
+         assert state["trajectory"] == []
+         assert state["completion"] == []
++        assert isinstance(state["error"], vf.ModelError)
+ 
+     @pytest.mark.asyncio
+     async def test_override_is_completed_respects_max_turns(
+@@ -704,3 +707,42 @@ class TestMultiTurnEnv:
+         assert completion[0]["content"] == "First response"
+         assert completion[1]["role"] == "user"
+         assert completion[1]["content"] == "Final feedback"
++
++
++@pytest.mark.asyncio
++async def test_overlong_prompt_before_first_step_sets_error(
++    mock_client, sample_chat_dataset, make_input
++):
++    """First-turn prompt overlength should not look like an empty success."""
++
++    class PromptTooLongEnv(MultiTurnEnv):
++        async def env_response(self, messages, state, **kwargs):  # type: ignore[override]
++            return [{"role": "user", "content": "Continue"}]
++
++    env = PromptTooLongEnv(
++        client=mock_client,
++        model="test-model",
++        dataset=sample_chat_dataset,
++        parser=Parser(),
++        rubric=Rubric(),
++        max_turns=1,
++    )
++    mock_client.get_response = AsyncMock(
++        side_effect=vf.OverlongPromptError("too long")
++    )
++
++    state = await env.rollout(
++        input=make_input(
++            prompt=[{"role": "user", "content": "Start conversation"}],
++            answer="target_answer",
++        ),
++        client=mock_client,
++        model="test-model",
++    )
++
++    assert state["prompt_too_long"] is True
++    assert state["is_truncated"] is True
++    assert state["stop_condition"] == "prompt_too_long"
++    assert state["trajectory"] == []
++    assert state["completion"] == []
++    assert isinstance(state["error"], vf.OverlongPromptError)
 diff --git a/verifiers/clients/renderer_client.py b/verifiers/clients/renderer_client.py
 index 64ca4ec8..99cd11b9 100644
 --- a/verifiers/clients/renderer_client.py
@@ -37,3 +105,37 @@ index 77d96d69..88883ca9 100644
  
          assert "example_id" in dataset.column_names
          assert "prompt" in dataset.column_names
+diff --git a/verifiers/envs/environment.py b/verifiers/envs/environment.py
+index 5e1c02ed..2c69e715 100644
+--- a/verifiers/envs/environment.py
++++ b/verifiers/envs/environment.py
+@@ -647,6 +647,14 @@ class Environment(ABC):
+                 step.get("is_truncated", False) for step in state.get("trajectory", [])
+             )
+             state["stop_condition"] = condition.__name__
++            if (
++                state["stop_condition"] == "prompt_too_long"
++                and not state.get("trajectory")
++                and state.get("error") is None
++            ):
++                state["error"] = vf.OverlongPromptError(
++                    "Prompt exceeded the configured prompt length before the first model response"
++                )
+             if state.get("stop_condition") == "has_error":
+                 err = state["error"]
+                 err_chain = ErrorChain(err)
+diff --git a/verifiers/envs/multiturn_env.py b/verifiers/envs/multiturn_env.py
+index 40d1aa3c..64c2281e 100644
+--- a/verifiers/envs/multiturn_env.py
++++ b/verifiers/envs/multiturn_env.py
+@@ -79,6 +79,10 @@ class MultiTurnEnv(vf.Environment):
+         state["timed_out"] = True
+         state["is_completed"] = True
+         state["stop_condition"] = "timeout_reached"
++        if not state.get("trajectory") and state.get("error") is None:
++            state["error"] = vf.ModelError(
++                "Rollout timed out before producing a trajectory step"
++            )
+ 
+     @vf.stop
+     async def max_total_completion_tokens_reached(self, state: State) -> bool:

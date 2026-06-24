@@ -1,7 +1,7 @@
-output_dir = "outputs/trinity-mini-cleanblend-localdecensor"
+output_dir = "outputs/trinity-mini-cleanblend-32k-cp2-chunk1024"
 clean_output_dir = true
 max_steps = 1000
-seq_len = 8192
+seq_len = 32768
 
 [log]
 level = "info"
@@ -15,7 +15,7 @@ num_infer_gpus = 4
 
 [wandb]
 project = "trinity-mini-prime-rl"
-name = "trinity-mini-cleanblend-localdecensor"
+name = "trinity-mini-cleanblend-32k-cp2-chunk1024"
 tags = ["trinity-mini", "prime-rl", "nemotron", "decensor", "eval-logging"]
 
 [ckpt]
@@ -27,11 +27,14 @@ keep_interval = 100
 dist_timeout_seconds = 1800
 
 [trainer.model]
-impl = "auto"
+impl = "custom"
 attn = "flash_attention_3"
 ep = 4
+fsdp_cpu_offload = false
 optim_cpu_offload = true
-fused_lm_head_token_chunk_size = "auto"
+cp = 2
+cp_style = "ulysses"
+fused_lm_head_token_chunk_size = 1024
 
 [trainer.model.ac]
 mode = "selective"
@@ -75,14 +78,14 @@ num_workers = 4
 max_retries = 3
 
 [orchestrator.train.sampling]
-max_completion_tokens = 8192
+max_completion_tokens = 16384
 temperature = 1.0
 
 [orchestrator.train.sampling.extra_body]
 top_k = -1
 min_p = 0.0
 return_token_ids = true
-max_prompt_len = 8192
+max_prompt_len = 16384
 
 [[orchestrator.pre_batch_filters]]
 type = "gibberish"
@@ -101,7 +104,7 @@ id = "nemotron-tool-calling"
 name = "tool-calling"
 ratio = 1.0
 group_size = 8
-max_total_completion_tokens = 8192
+max_total_completion_tokens = 16384
 timeout = 1800
 
 [orchestrator.train.env.args]
@@ -127,7 +130,7 @@ id = "nemotron-instruction-following"
 name = "instruction-following"
 ratio = 1.0
 group_size = 8
-max_total_completion_tokens = 8192
+max_total_completion_tokens = 16384
 timeout = 1800
 
 [orchestrator.train.env.args]
@@ -151,7 +154,7 @@ id = "nemotron-knowledge"
 name = "knowledge"
 ratio = 1.0
 group_size = 8
-max_total_completion_tokens = 8192
+max_total_completion_tokens = 16384
 timeout = 1800
 
 [orchestrator.train.env.args]
@@ -176,7 +179,7 @@ id = "nemotron-reasoning"
 name = "reasoning"
 ratio = 1.0
 group_size = 8
-max_total_completion_tokens = 8192
+max_total_completion_tokens = 16384
 timeout = 1800
 
 [orchestrator.train.env.args]
@@ -201,7 +204,7 @@ id = "decensor-env"
 name = "decensor"
 ratio = 1.0
 group_size = 8
-max_total_completion_tokens = 8192
+max_total_completion_tokens = 16384
 timeout = 2400
 
 [orchestrator.train.env.args]
@@ -252,7 +255,7 @@ skip_first_step = false
 [orchestrator.eval.sampling]
 temperature = 0.0
 top_p = 1.0
-max_completion_tokens = 8192
+max_completion_tokens = 16384
 
 [[orchestrator.eval.env]]
 id = "aime2025"
@@ -306,7 +309,7 @@ api_server_count = 1
 enable_expert_parallel = true
 
 [inference.model]
-max_model_len = 8192
+max_model_len = 32768
 tool_call_parser = "None"
 reasoning_parser = "None"
 

@@ -253,6 +253,12 @@ def _extract_function_calls(text: str) -> list[dict[str, Any]]:
     if not text:
         return []
     calls: list[dict[str, Any]] = []
+    stripped = text.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            _append_call_from_obj(calls, json.loads(stripped))
+        except Exception:
+            pass
     for m in ARRAY_JSON_RE.finditer(text):
         try:
             arr = json.loads(m.group(1))
@@ -563,6 +569,29 @@ def _load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[
 
     path = hf_hub_download(repo, filename, repo_type="dataset")
     rows: list[dict[str, Any]] = []
+    rng = random.Random(seed)
+
+    if num_examples > 0:
+        seen = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                seen += 1
+                if len(rows) < num_examples:
+                    rows.append(row)
+                    continue
+                replacement = rng.randrange(seen)
+                if replacement < num_examples:
+                    rows[replacement] = row
+        rng.shuffle(rows)
+        return rows
+
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -572,10 +601,7 @@ def _load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    rng = random.Random(seed)
     rng.shuffle(rows)
-    if num_examples > 0:
-        rows = rows[:num_examples]
     return rows
 
 

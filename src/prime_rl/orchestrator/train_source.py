@@ -44,10 +44,25 @@ class TrainSource:
             self.weights: list[float] = [float(r) for r in configured_ratios]  # type: ignore[arg-type]
         else:
             self.weights = [float(len(self.examples[name])) for name in self.env_names]
+        self.total_weight = sum(max(0.0, weight) for weight in self.weights)
+        if self.total_weight <= 0.0:
+            raise ValueError("TrainSource needs at least one env with positive ratio or examples")
+        self.current_weights = {name: 0.0 for name in self.env_names}
+
+    def _next_env_name(self, available_permits: int) -> str | None:
+        next_weights = dict(self.current_weights)
+        for name, weight in zip(self.env_names, self.weights, strict=True):
+            next_weights[name] += max(0.0, weight)
+        env_name = max(self.env_names, key=lambda name: next_weights[name])
+        if self.env_costs[env_name] > available_permits:
+            return None
+        self.current_weights = next_weights
+        self.current_weights[env_name] -= self.total_weight
+        return env_name
 
     def next_example(self, available_permits: int) -> dict | None:
-        env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
-        if self.env_costs[env_name] > available_permits:
+        env_name = self._next_env_name(available_permits)
+        if env_name is None:
             return None
         rows = self.examples[env_name]
         cursor = self.cursors[env_name]

@@ -504,8 +504,19 @@ class GuardedRubric(vf.Rubric):
             format_reward = 0.78 * tool_shape + 0.22 * reasoning_quality
             metrics["anti_hacking_format_reward"] = format_reward
         weight = clamp01(self.config.format_reward_weight)
-        state["reward"] = multiplier * ((1.0 - weight) * base_reward + weight * format_reward)
+        final_reward = multiplier * ((1.0 - weight) * base_reward + weight * format_reward)
+        metrics["anti_hacking_format_reward"] = format_reward
+        metrics["anti_hacking_format_reward_weight"] = weight
+        metrics["final_reward"] = final_reward
+        breakdown = dict(metrics)
+        breakdown["final_reward_formula"] = (
+            "anti_hacking_multiplier * "
+            "((1 - anti_hacking_format_reward_weight) * task_reward + "
+            "anti_hacking_format_reward_weight * anti_hacking_format_reward)"
+        )
+        state["reward"] = final_reward
         state["metrics"] = metrics
+        state["anti_hacking_breakdown"] = breakdown
 
     async def score_group(self, states: list[vf.State]):
         await asyncio.gather(*(self.score_rollout(state) for state in states))
