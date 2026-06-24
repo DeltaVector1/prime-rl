@@ -1,0 +1,39 @@
+diff --git a/verifiers/clients/renderer_client.py b/verifiers/clients/renderer_client.py
+index 64ca4ec8..99cd11b9 100644
+--- a/verifiers/clients/renderer_client.py
++++ b/verifiers/clients/renderer_client.py
+@@ -542,6 +542,9 @@ class RendererClient(
+             **dict(kwargs.pop("extra_headers", None) or {}),
+         }
+         sampling_params: dict[str, Any] = dict(args.pop("extra_body", None) or {})
++        max_prompt_len = sampling_params.pop("max_prompt_len", None)
++        if max_prompt_len is not None:
++            max_prompt_len = int(max_prompt_len)
+ 
+         # ``chat_template_kwargs`` belong to the renderer, not the engine —
+         # peel them off the per-request sampling and fold them into the
+@@ -627,6 +630,7 @@ class RendererClient(
+                 or sampling_params.pop("cache_salt", None),
+                 priority=args.get("priority") or sampling_params.pop("priority", None),
+                 extra_headers=extra_headers or None,
++                max_prompt_len=max_prompt_len,
+             )
+         except RendererOverlongPromptError as exc:
+             raise OverlongPromptError(str(exc)) from exc
+diff --git a/verifiers/envs/env_group.py b/verifiers/envs/env_group.py
+index 77d96d69..88883ca9 100644
+--- a/verifiers/envs/env_group.py
++++ b/verifiers/envs/env_group.py
+@@ -281,11 +281,7 @@ class EnvGroup(vf.Environment):
+         if "example_id" in dataset.column_names:
+             dataset = dataset.remove_columns(["example_id"])
+ 
+-        def add_example_id(example, i):
+-            example["example_id"] = i
+-            return example
+-
+-        dataset = dataset.map(add_example_id, with_indices=True, **map_kwargs)
++        dataset = dataset.add_column("example_id", range(len(dataset)))
+ 
+         assert "example_id" in dataset.column_names
+         assert "prompt" in dataset.column_names

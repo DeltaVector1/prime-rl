@@ -101,6 +101,8 @@ All metrics print to the console log (and W&B when configured).
 | `metrics/{env}/{metric}` | env-specific (e.g. pass rate) |
 | `eval/{env}/{avg@k,pass@k}` | eval scores when configured |
 
+For guarded envs, compare `reward/{env}/mean` with `metrics/{env}/task_reward`. If task reward is healthy but final reward is flat or much lower, inspect `metrics/{env}/anti_hacking_multiplier` first, then the suppressors: `anti_hacking_coherency`, `anti_hacking_reasoning_coherency`, `anti_hacking_reasoning_ethics`, `anti_hacking_missing_reasoning`, `anti_hacking_local_meta`, and `anti_hacking_meta_commentary`. Coherency judges should evaluate visible text quality only; they should not penalize missing `<think>` tags when reasoning traces were stripped before judging.
+
 **Stability** — trainer log:
 
 | Metric | Description |

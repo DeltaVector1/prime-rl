@@ -80,8 +80,22 @@ class MetricsBuilder:
             solve_all = (reward_per_problem == expected).mean()
             return solve_none, solve_all, 1 - solve_none - solve_all
 
+        def compute_soft_solve_rates(df):
+            grouped = df.groupby("group_id")
+            reward_per_problem = grouped.reward.sum()
+            expected = grouped.env_name.first().map(env_group_size).astype(float)
+            reward_fraction = (reward_per_problem / expected).clip(lower=0.0, upper=1.0)
+            return {
+                "soft_solve": reward_fraction.mean(),
+                "solve_nonzero": (reward_per_problem > 0).mean(),
+                "solve_ge_0_25": (reward_fraction >= 0.25).mean(),
+                "solve_ge_0_50": (reward_fraction >= 0.50).mean(),
+                "solve_ge_0_75": (reward_fraction >= 0.75).mean(),
+            }
+
         by_example = results_df.groupby("group_id")
         solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
+        soft_solve_rates = compute_soft_solve_rates(results_df)
 
         to_log: dict[str, Any] = {
             "progress/tokens": num_tokens,
@@ -130,6 +144,7 @@ class MetricsBuilder:
             "solve_none/all": solve_none,
             "solve_all/all": solve_all,
             "effective_batch_size/all": effective_batch_size,
+            **{f"{key}/all": value for key, value in soft_solve_rates.items()},
             **{f"batch/{env}": r for env, r in results_df.env_name.value_counts(normalize=True).items()},
             "time/step": step_time,
             "time/teacher_logprobs": teacher_logprobs_time,
@@ -168,6 +183,8 @@ class MetricsBuilder:
             to_log[f"solve_none/{env}"] = sn
             to_log[f"solve_all/{env}"] = sa
             to_log[f"effective_batch_size/{env}"] = eb
+            for key, value in compute_soft_solve_rates(env_df).items():
+                to_log[f"{key}/{env}"] = value
             to_log[f"stop_condition/{env}/generation_truncated"] = (
                 env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
             ).mean()

@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from verifiers.serve import ZMQEnvServer
 
@@ -30,6 +31,7 @@ def run_server(config: EnvServerConfig):
         log_dir=log_dir,
         json_logging=config.log.json_logging,
         num_workers=config.env.num_workers,
+        worker_heartbeat_timeout=float(os.environ.get("PRIME_ENV_WORKER_HEARTBEAT_TIMEOUT", "300")),
         **{"address": config.env.address} if config.env.address is not None else {},
     )
     asyncio.run(server.run())

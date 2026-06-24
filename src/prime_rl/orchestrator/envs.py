@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import multiprocessing as mp
+import os
 from collections.abc import Iterator, Sequence
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -75,8 +76,11 @@ class Env:
             f"num_workers must be resolved before spawn, got {self.config.num_workers!r}"
         )
         num_workers = self.config.num_workers
+        worker_heartbeat_timeout = float(os.environ.get("PRIME_ENV_WORKER_HEARTBEAT_TIMEOUT", "300"))
         address = f"tcp://127.0.0.1:{get_free_port()}"
-        get_logger().debug(f"Spawning env server {self.name} ({address=}, {num_workers=})")
+        get_logger().debug(
+            f"Spawning env server {self.name} ({address=}, {num_workers=}, {worker_heartbeat_timeout=})"
+        )
         process = mp.get_context("spawn").Process(
             target=ZMQEnvServer.run_server,
             args=(
@@ -91,6 +95,7 @@ class Env:
                 json_logging=json_logging,
                 console_logging=False,
                 num_workers=num_workers,
+                worker_heartbeat_timeout=worker_heartbeat_timeout,
             ),
             daemon=False,
         )
