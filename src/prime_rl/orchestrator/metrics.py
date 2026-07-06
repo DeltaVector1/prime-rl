@@ -166,37 +166,39 @@ class MetricsBuilder:
         for env, env_df in results_df.groupby("env_name"):
             env_by_example = env_df.groupby("group_id")
             for col in per_env_columns:
-                to_log[f"{col}/{env}/mean"] = env_by_example[col].mean().mean()
-                to_log[f"{col}/{env}/max"] = env_by_example[col].mean().max()
+                to_log[self.env_metric_key(env, col, "mean")] = env_by_example[col].mean().mean()
+                to_log[self.env_metric_key(env, col, "max")] = env_by_example[col].mean().max()
                 if col != "is_truncated":
-                    to_log[f"{col}/{env}/min"] = env_by_example[col].mean().min()
+                    to_log[self.env_metric_key(env, col, "min")] = env_by_example[col].mean().min()
             env_timing_df = timing_df.loc[env_df.index]
             for key in timing_df.columns:
                 per_example = env_timing_df.groupby(env_df["group_id"])[key].mean()
-                to_log[f"timing/{env}/{key}/mean"] = per_example.mean()
-                to_log[f"timing/{env}/{key}/max"] = per_example.max()
-                to_log[f"timing/{env}/{key}/min"] = per_example.min()
-            to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
-            to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
-            to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
+                to_log[self.env_metric_key(env, "timing", key, "mean")] = per_example.mean()
+                to_log[self.env_metric_key(env, "timing", key, "max")] = per_example.max()
+                to_log[self.env_metric_key(env, "timing", key, "min")] = per_example.min()
+            to_log[self.env_metric_key(env, "reward", "mean")] = env_by_example.reward.mean().mean()
+            to_log[self.env_metric_key(env, "reward", "max")] = env_by_example.reward.mean().max()
+            to_log[self.env_metric_key(env, "reward", "min")] = env_by_example.reward.mean().min()
             sn, sa, eb = compute_solve_rates(env_df)
-            to_log[f"solve_none/{env}"] = sn
-            to_log[f"solve_all/{env}"] = sa
-            to_log[f"effective_batch_size/{env}"] = eb
+            to_log[self.env_metric_key(env, "solve_none")] = sn
+            to_log[self.env_metric_key(env, "solve_all")] = sa
+            to_log[self.env_metric_key(env, "effective_batch_size")] = eb
             for key, value in compute_soft_solve_rates(env_df).items():
-                to_log[f"{key}/{env}"] = value
-            to_log[f"stop_condition/{env}/generation_truncated"] = (
+                to_log[self.env_metric_key(env, key)] = value
+            to_log[self.env_metric_key(env, "stop_condition", "generation_truncated")] = (
                 env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
             ).mean()
             for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
-                to_log[f"stop_condition/{env}/{sc}"] = rate
+                to_log[self.env_metric_key(env, "stop_condition", sc)] = rate
             env_metrics_df = metrics_df.loc[env_df.index] if not metrics_df.empty else metrics_df
             for metric in metrics_df.columns:
-                to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["group_id"])[metric].mean().mean()
-            to_log[f"filters/{env}/is_filtered"] = env_df.is_filtered.astype(float).mean()
+                to_log[self.env_metric_key(env, "metrics", metric, "mean")] = (
+                    env_metrics_df.groupby(env_df["group_id"])[metric].mean().mean()
+                )
+            to_log[self.env_metric_key(env, "filters", "is_filtered")] = env_df.is_filtered.astype(float).mean()
             env_filter_df = filter_df.loc[env_df.index] if not filter_df.empty else filter_df
             for name in filter_df.columns:
-                to_log[f"filters/{env}/{name}"] = env_filter_df[name].astype(float).mean()
+                to_log[self.env_metric_key(env, "filters", name)] = env_filter_df[name].astype(float).mean()
 
         # Dispatcher / watcher gauges live on the ``_timestamp`` axis via
         # the periodic logger — keep this dict step-axis only
@@ -227,6 +229,11 @@ class MetricsBuilder:
         if token_export:
             self._last_token_export_step_logged = token_export["trainer/step"]
         return token_export
+
+    @staticmethod
+    def env_metric_key(env_name: str, *parts: object) -> str:
+        """W&B key for concrete per-env metrics: env first, then metric path."""
+        return "/".join([env_name, *(str(part) for part in parts)])
 
     @staticmethod
     def timing_df(rollouts: list[TrainRollout]) -> pd.DataFrame:

@@ -1,6 +1,6 @@
 output_dir = "outputs/trinity-mini-cleanblend-32k-cp2-chunk1024"
 clean_output_dir = true
-max_steps = 1000
+max_steps = 200
 seq_len = 32768
 
 [log]
@@ -15,8 +15,6 @@ num_infer_gpus = 4
 
 [wandb]
 project = "trinity-mini-prime-rl"
-name = "trinity-mini-cleanblend-32k-cp2-chunk1024"
-tags = ["trinity-mini", "prime-rl", "nemotron", "decensor", "eval-logging"]
 
 [ckpt]
 interval = 25
@@ -59,7 +57,7 @@ save_sharded = true
 [orchestrator]
 batch_size = 2048
 group_size = 8
-oversampling_factor = 1.0
+oversampling_factor = 0.0625
 max_off_policy_steps = 8
 pool_size = 1
 tasks_per_minute = 240
@@ -110,18 +108,22 @@ timeout = 1800
 [orchestrator.train.env.args]
 dataset = "tool_use_pivot,function_calling,swe_pivot"
 judge_model = "Gemma3"
-judge_base_url = "http://216.243.220.29:40001/v1"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
 num_train_examples = 4096
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
 enable_native_tool_calls = false
-enable_anti_hacking_judges = true
-anti_hacking_judge_base_url = "http://216.243.220.29:40001/v1"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 enable_structured_marker_gate = false
 anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
 anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
 anti_hacking_format_reward_weight = 0.15
 anti_hacking_allow_renderer_stripped_tool_calls = true
 
@@ -136,17 +138,21 @@ timeout = 1800
 [orchestrator.train.env.args]
 dataset = "ifeval,structured_v2_direct,structured_v2_diversified,citation_format,freeform_formatting,calendar,multichallenge,adversarial,identity,sysbench,cfbench,inverse_ifeval"
 judge_model = "Gemma3"
-judge_base_url = "http://216.243.220.29:40001/v1"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
 num_train_examples = 4096
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
-enable_anti_hacking_judges = true
-anti_hacking_judge_base_url = "http://216.243.220.29:40001/v1"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 enable_structured_marker_gate = false
 anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
 anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
 anti_hacking_format_reward_weight = 0.10
 
 [[orchestrator.train.env]]
@@ -160,18 +166,22 @@ timeout = 1800
 [orchestrator.train.env.args]
 dataset = "mcqa,qa_abstention"
 judge_model = "Gemma3"
-judge_base_url = "http://216.243.220.29:40001/v1"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
 num_train_examples = 4096
 enable_task_judges = true
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
-enable_anti_hacking_judges = true
-anti_hacking_judge_base_url = "http://216.243.220.29:40001/v1"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 enable_structured_marker_gate = false
 anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
 anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
 anti_hacking_format_reward_weight = 0.10
 
 [[orchestrator.train.env]]
@@ -185,50 +195,51 @@ timeout = 1800
 [orchestrator.train.env.args]
 dataset = "reasoning_gym,math,science,arc_agi"
 judge_model = "Gemma3"
-judge_base_url = "http://216.243.220.29:40001/v1"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
 num_train_examples = 4096
 enable_task_judges = true
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
-enable_anti_hacking_judges = true
-anti_hacking_judge_base_url = "http://216.243.220.29:40001/v1"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 enable_structured_marker_gate = false
 anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
 anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
 anti_hacking_format_reward_weight = 0.10
 
 [[orchestrator.train.env]]
 id = "decensor-env"
 name = "decensor"
-ratio = 1.0
+ratio = 4.0
 group_size = 8
 max_total_completion_tokens = 16384
-timeout = 2400
+timeout = 3600
 
 [orchestrator.train.env.args]
 max_turns = 6
 judge_min_p = 0.05
 judge_model = "Gemma3"
 judge_api_key = "dummy-key"
-judge_timeout = 120
-judge_base_url = "http://216.243.220.29:40001/v1"
+judge_timeout = 1200
+judge_base_url = ["http://198.13.252.114:40000/v1", "http://72.46.85.157:30121/v1"]
 user_sim_min_p = 0.05
 user_sim_model = "Gemma3"
-keep_alive_ratio = 0.15
 turn_decay_ratio = 0.5
 user_sim_api_key = "dummy-key"
-user_sim_timeout = 120
+user_sim_timeout = 300
 enable_word_count = true
-judge_temperature = 0.3
+judge_temperature = 1.0
 num_eval_examples = 128
 reasoning_enabled = true
-user_sim_base_url = "http://216.243.220.29:40001/v1"
-keep_alive_weights = [0.4, 0.6]
-num_train_examples = 12000
+user_sim_base_url = ["http://198.13.252.114:40000/v1", "http://72.46.85.157:30121/v1"]
+num_train_examples = -1
 bucket_styles_ratio = 0.25
-keep_alive_datasets = ["Delta-Vector/Hydrus-Filtered-Helpsteer3-Preference-ShareGPT", "anthracite-org/kalo-opus-instruct-22k-no-refusal"]
 user_sim_max_tokens = 256
 user_sim_temperature = 1.2
 bucket_markdown_ratio = 0.5
@@ -238,7 +249,7 @@ bucket_plaintext_ratio = 0.25
 enable_markdown_judges = true
 enable_meta_commentary = true
 enable_reasoning_trace = true
-max_concurrent_scoring = 32
+max_concurrent_scoring = 8
 enable_structured_markers = true
 enable_reasoning_coherency = true
 meta_commentary_multiplier = 0.01
@@ -250,7 +261,7 @@ incoherent_penalty_multiplier = 0.1
 interval = 25
 num_examples = 64
 group_size = 1
-skip_first_step = false
+skip_first_step = true
 
 [orchestrator.eval.sampling]
 temperature = 0.0

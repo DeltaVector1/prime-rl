@@ -32,10 +32,76 @@ import verifiers as vf
 import yaml
 from datasets import Dataset, load_dataset
 from huggingface_hub import hf_hub_download
+from nemotron_ifeval_checkers import CHECKERS, _evaluate_constraints
+from nemotron_instruction_following_guardrails import (
+    AntiHackingConfig,
+    compose_system_prompt,
+    guard_env,
+    merge_system_prompt,
+    parse_bool,
+)
 from openai import AsyncOpenAI
 
-from nemotron_ifeval_checkers import CHECKERS, _evaluate_constraints
-from nemotron_instruction_following_guardrails import AntiHackingConfig, compose_system_prompt, guard_env, merge_system_prompt, parse_bool
+
+class _RoundRobinChatCompletions:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self._clients = clients
+        self._index = 0
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return await client.chat.completions.create(*args, **kwargs)
+
+
+class _RoundRobinChat:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.completions = _RoundRobinChatCompletions(clients)
+
+
+class _RoundRobinOpenAI:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.chat = _RoundRobinChat(clients)
+
+
+def _normalize_base_urls(base_url: Any) -> list[str]:
+    if base_url is None:
+        return []
+    if isinstance(base_url, str):
+        value = base_url.strip()
+        if value.startswith("["):
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                parsed = value
+            raw_urls = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+        else:
+            raw_urls = [value]
+    elif isinstance(base_url, (list, tuple)):
+        raw_urls = base_url
+    else:
+        raw_urls = [base_url]
+
+    urls: list[str] = []
+    for raw_url in raw_urls:
+        if raw_url is None:
+            continue
+        url = str(raw_url).strip().rstrip("/")
+        if not url:
+            continue
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        urls.append(url)
+    return urls
+
+
+def _openai_client(api_key: str, base_url: Any, http_client: Any = None) -> Any:
+    urls = _normalize_base_urls(base_url)
+    if len(urls) <= 1:
+        return AsyncOpenAI(api_key=api_key, base_url=urls[0] if urls else base_url, http_client=http_client)
+    clients = [AsyncOpenAI(api_key=api_key, base_url=url, http_client=http_client) for url in urls]
+    return _RoundRobinOpenAI(clients)
+
 
 try:
     import tomllib
@@ -892,7 +958,7 @@ def load_environment(
 
     judge_client = None
     if any(k in _NEEDS_JUDGE for k in keys) or (enable_anti_hacking and enable_anti_hacking_judges):
-        judge_client = AsyncOpenAI(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
+        judge_client = _openai_client(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
 
     guard_config = None
     if enable_anti_hacking:
@@ -903,7 +969,7 @@ def load_environment(
         if enable_anti_hacking_judges and (
             guard_client is None or guard_model != judge_model or guard_base_url != judge_base_url
         ):
-            guard_client = AsyncOpenAI(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
+            guard_client = _openai_client(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
         guard_config = AntiHackingConfig(
             judge_client=guard_client if enable_anti_hacking_judges else None,
             judge_model=guard_model,

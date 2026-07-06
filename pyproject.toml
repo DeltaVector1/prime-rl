@@ -40,6 +40,17 @@ dependencies = [
     "flash-linear-attention",
     "nvidia-ml-py>=12.575.51",
     "pybase64>=1.4.2",
+    "code-env",
+    "decensor-env",
+    "ifeval",
+    "logic-env",
+    "math-env",
+    "mini-swe-agent-plus",
+    "nemotron-instruction-following",
+    "nemotron-knowledge",
+    "nemotron-reasoning",
+    "nemotron-tool-calling",
+    "science-env",
 ]
 
 [project.scripts]
@@ -200,26 +211,31 @@ nixl-cu12 = false
 
 [tool.uv.sources]
 prime-rl-configs = { path = "packages/prime-rl-configs", editable = true }
+decensor-env = { path = "external_envs/decensor-env", editable = true }
+nemotron-instruction-following = { path = "external_envs/nemotron-instruction-following", editable = true }
+nemotron-knowledge = { path = "external_envs/nemotron-knowledge", editable = true }
+nemotron-reasoning = { path = "external_envs/nemotron-reasoning", editable = true }
+nemotron-tool-calling = { path = "external_envs/nemotron-tool-calling", editable = true }
 verifiers = { path = "deps/verifiers", editable = true }
 renderers = { path = "deps/renderers", editable = true }
 prime-pydantic-config = { path = "deps/pydantic-config", editable = true }
 aime2024 = { path = "deps/research-environments/environments/aime2024", editable = true }
 aime2025 = { path = "deps/research-environments/environments/aime2025", editable = true }
 alphabet-sort = { path = "deps/verifiers/environments/alphabet_sort", editable = true }
-code-env = { path = "deps/research-environments/environments/code_env", editable = true }
+code-env = { path = "external_envs/code-env", editable = true }
 color-codeword = { path = "deps/research-environments/environments/color_codeword", editable = true }
 deepdive = { path = "deps/research-environments/environments/deepdive", editable = true }
 general-agent = { path = "deps/research-environments/environments/general_agent", editable = true }
 gpqa = { path = "deps/research-environments/environments/gpqa", editable = true }
 harnesses = { path = "deps/verifiers/packages/harnesses", editable = true }
 hle = { path = "deps/research-environments/environments/hle", editable = true }
-ifeval = { path = "deps/research-environments/environments/ifeval", editable = true }
+ifeval = { path = "external_envs/arcee-ifeval", editable = true }
 livecodebench = { path = "deps/research-environments/environments/livecodebench", editable = true }
-logic-env = { path = "deps/research-environments/environments/logic_env", editable = true }
-math-env = { path = "deps/research-environments/environments/math_env", editable = true }
+logic-env = { path = "external_envs/logic-env", editable = true }
+math-env = { path = "external_envs/math-env", editable = true }
 math-python = { path = "deps/verifiers/environments/math_python", editable = true }
 math500 = { path = "deps/research-environments/environments/math500", editable = true }
-mini-swe-agent-plus = { path = "deps/research-environments/environments/mini_swe_agent_plus", editable = true }
+mini-swe-agent-plus = { path = "external_envs/mini-swe-agent-plus", editable = true }
 mmlu-pro = { path = "deps/research-environments/environments/mmlu_pro", editable = true }
 opencode-cp = { path = "deps/research-environments/environments/opencode_cp", editable = true }
 opencode-deepdive = { path = "deps/research-environments/environments/opencode_deepdive", editable = true }
@@ -230,7 +246,7 @@ reverse-text = { path = "deps/verifiers/environments/reverse_text", editable = t
 rlm-swe = { path = "deps/research-environments/environments/rlm_swe", editable = true }
 rlm-search = { path = "deps/research-environments/environments/rlm_search", editable = true }
 rlm-uuid-ctf = { path = "deps/research-environments/environments/rlm_uuid_ctf", editable = true }
-science-env = { path = "deps/research-environments/environments/science_env", editable = true }
+science-env = { path = "external_envs/science-env", editable = true }
 simpleqa-verified = { path = "deps/research-environments/environments/simpleqa_verified", editable = true }
 tau2-bench = { path = "deps/research-environments/environments/tau2_bench", editable = true }
 tasksets = { path = "deps/verifiers/packages/tasksets", editable = true }

@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import cast
@@ -801,6 +802,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
             )
             snapshot_path = snapshot_path / "prime"
+            if snapshot_path.exists() and not (snapshot_path / "model.safetensors.index.json").exists() and get_world().is_master:
+                logger.warning(f"Removing incomplete PrimeRL conversion cache at {snapshot_path}")
+                shutil.rmtree(snapshot_path)
             if not snapshot_path.exists() and get_world().is_master:
                 logger.debug(
                     f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
@@ -815,6 +819,9 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                 "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
             )
             snapshot_path = snapshot_path / "hf"
+            if snapshot_path.exists() and not (snapshot_path / "model.safetensors.index.json").exists() and get_world().is_master:
+                logger.warning(f"Removing incomplete HF conversion cache at {snapshot_path}")
+                shutil.rmtree(snapshot_path)
             if not snapshot_path.exists() and get_world().is_master:
                 logger.debug(
                     f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."

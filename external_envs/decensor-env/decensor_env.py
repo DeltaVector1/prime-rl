@@ -9,12 +9,72 @@ import re
 from typing import Any
 
 import httpx
+import verifiers as vf
 from datasets import Dataset, load_dataset
 from huggingface_hub import hf_hub_download
 from openai import AsyncOpenAI
-
-import verifiers as vf
 from verifiers.types import Messages, State
+
+
+class _RoundRobinChatCompletions:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self._clients = clients
+        self._index = 0
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return await client.chat.completions.create(*args, **kwargs)
+
+
+class _RoundRobinChat:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.completions = _RoundRobinChatCompletions(clients)
+
+
+class _RoundRobinOpenAI:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.chat = _RoundRobinChat(clients)
+
+
+def _normalize_base_urls(base_url: Any) -> list[str]:
+    if base_url is None:
+        return []
+    if isinstance(base_url, str):
+        value = base_url.strip()
+        if value.startswith("["):
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                parsed = value
+            raw_urls = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+        else:
+            raw_urls = [value]
+    elif isinstance(base_url, (list, tuple)):
+        raw_urls = base_url
+    else:
+        raw_urls = [base_url]
+
+    urls: list[str] = []
+    for raw_url in raw_urls:
+        if raw_url is None:
+            continue
+        url = str(raw_url).strip().rstrip("/")
+        if not url:
+            continue
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        urls.append(url)
+    return urls
+
+
+def _openai_client(api_key: str, base_url: Any, http_client: Any = None) -> Any:
+    urls = _normalize_base_urls(base_url)
+    if len(urls) <= 1:
+        return AsyncOpenAI(api_key=api_key, base_url=urls[0] if urls else base_url, http_client=http_client)
+    clients = [AsyncOpenAI(api_key=api_key, base_url=url, http_client=http_client) for url in urls]
+    return _RoundRobinOpenAI(clients)
+
 
 WORD_REQUIREMENTS: tuple[tuple[str, int, int, int], ...] = (
     ("Be verbose", 2000, 1900, 2100),
@@ -971,13 +1031,7 @@ def _build_keep_alive_pool(
     return out
 
 
-def _iter_decensor_rows(ds_name: str):
-    """Yield decensor rows from a local JSONL cache when available.
-
-    The HF dataset has heterogeneous metadata fields that make non-streaming
-    Arrow loading brittle. Local JSONL parsing avoids repeated Hub API calls
-    from every env worker while keeping the remote streaming fallback intact.
-    """
+def _decensor_candidate_paths(ds_name: str) -> list[str]:
     candidate_paths: list[str] = []
     if os.path.isfile(ds_name):
         candidate_paths.append(ds_name)
@@ -989,8 +1043,26 @@ def _iter_decensor_rows(ds_name: str):
         candidate_paths.append(
             os.path.join(repo_root, "data", "NewEden-RL-seed-Decensor", "rl.jsonl")
         )
+    return candidate_paths
 
-    for path in candidate_paths:
+
+def _count_local_decensor_rows(ds_name: str) -> int | None:
+    for path in _decensor_candidate_paths(ds_name):
+        if not os.path.isfile(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    return None
+
+
+def _iter_decensor_rows(ds_name: str):
+    """Yield decensor rows from a local JSONL cache when available.
+
+    The HF dataset has heterogeneous metadata fields that make non-streaming
+    Arrow loading brittle. Local JSONL parsing avoids repeated Hub API calls
+    from every env worker while keeping the remote streaming fallback intact.
+    """
+    for path in _decensor_candidate_paths(ds_name):
         if not os.path.isfile(path):
             continue
         with open(path, "r", encoding="utf-8") as f:
@@ -1095,6 +1167,15 @@ def build_multiturn_dataset(
     enable_length_prompts: bool,
     output_prompt: str | None,
 ) -> Dataset:
+    if num_examples < 0:
+        decensor_count = _count_local_decensor_rows(decensor_dataset_name)
+        if decensor_count is None:
+            raise ValueError(
+                "num_examples=-1 requires a local decensor JSONL cache so the row count is known"
+            )
+        keep_alive_ratio_for_count = min(max(keep_alive_ratio, 0.0), 0.95)
+        num_examples = round(decensor_count / max(1.0 - keep_alive_ratio_for_count, 1e-9))
+
     n_keep = round(num_examples * keep_alive_ratio)
     n_dec = num_examples - n_keep
 
@@ -1770,7 +1851,7 @@ def load_environment(
     num_eval_examples: int = 500,
     dataset_seed: int = 42,
     judge_model: str = "google/gemma-4-26B-A4B-it",
-    judge_base_url: str = "http://216.243.220.158:20003/v1",
+    judge_base_url: str | list[str] = "http://216.243.220.158:20003/v1",
     judge_api_key: str | None = None,
     judge_temperature: float = 0.8,
     judge_min_p: float = 0.05,
@@ -1803,7 +1884,7 @@ def load_environment(
     max_turns: int = 6,
     # --- User simulator knobs ---
     user_sim_model: str | None = None,
-    user_sim_base_url: str | None = None,
+    user_sim_base_url: str | list[str] | None = None,
     user_sim_api_key: str | None = None,
     user_sim_temperature: float = 1.0,
     user_sim_min_p: float = 0.0,
@@ -1910,7 +1991,7 @@ def load_environment(
         limits=httpx.Limits(max_connections=max_concurrent_scoring, max_keepalive_connections=max_concurrent_scoring),
         timeout=judge_timeout,
     )
-    client = AsyncOpenAI(base_url=judge_base_url, api_key=judge_api_key, http_client=http_client)
+    client = _openai_client(base_url=judge_base_url, api_key=judge_api_key, http_client=http_client)
 
     # Separate HTTP client for the user simulator so its concurrency doesn't
     # starve judge scoring (same endpoint is fine — different connection pool).
@@ -1918,7 +1999,7 @@ def load_environment(
         limits=httpx.Limits(max_connections=max_concurrent_scoring, max_keepalive_connections=max_concurrent_scoring),
         timeout=user_sim_timeout,
     )
-    user_sim_client = AsyncOpenAI(
+    user_sim_client = _openai_client(
         base_url=user_sim_base_url, api_key=user_sim_api_key, http_client=user_sim_http_client,
     )
 

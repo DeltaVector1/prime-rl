@@ -1,0 +1,434 @@
+output_dir = "outputs/trinity-mini-step100-hardmix-local-sandbox-32k"
+clean_output_dir = true
+max_steps = 200
+seq_len = 32768
+
+[log]
+level = "info"
+
+[model]
+name = "/root/prime/outputs/trinity-mini-cleanblend-32k-cp2-chunk1024/weights/step_100"
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[wandb]
+project = "trinity-mini-prime-rl"
+name = "trinity-mini-step100-hardmix-local-sandbox"
+
+[ckpt]
+interval = 25
+keep_last = 2
+keep_interval = 100
+
+[trainer]
+dist_timeout_seconds = 1800
+
+[trainer.model]
+impl = "custom"
+attn = "flash_attention_3"
+ep = 4
+fsdp_cpu_offload = false
+optim_cpu_offload = true
+cp = 2
+cp_style = "ulysses"
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.ac]
+mode = "selective"
+freq = 1
+targets = ["norm", "attn_proj", "linear_attn", "routed_experts"]
+
+[trainer.model.lora]
+rank = 32
+alpha = 64
+dropout = 0.0
+
+[trainer.optim]
+type = "adamw"
+lr = 0.000008
+weight_decay = 0.0
+max_norm = 1.0
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+save_sharded = true
+
+[orchestrator]
+batch_size = 2048
+group_size = 8
+oversampling_factor = 0.0625
+max_off_policy_steps = 8
+pool_size = 1
+tasks_per_minute = 240
+
+[orchestrator.wandb.log_extras]
+interval = 25
+sample_ratio = 0.02
+
+[orchestrator.renderer]
+name = "default"
+reasoning_parser = "think"
+tool_parser = "qwen3.5"
+
+[orchestrator.train]
+num_workers = 4
+max_retries = 3
+
+[orchestrator.train.sampling]
+max_completion_tokens = 16384
+temperature = 1.0
+
+[orchestrator.train.sampling.extra_body]
+top_k = -1
+min_p = 0.0
+return_token_ids = true
+max_prompt_len = 16384
+
+[[orchestrator.pre_batch_filters]]
+type = "gibberish"
+enforce = true
+
+[[orchestrator.pre_batch_filters]]
+type = "repetition"
+enforce = true
+
+[[orchestrator.pre_batch_filters]]
+type = "zero_advantage"
+enforce = true
+
+[[orchestrator.train.env]]
+id = "code-env"
+name = "code-env"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@8_qwen3_4b_instruct_2507"
+min_solve_rate = 0.0
+max_solve_rate = 0.60
+timeout_per_test = 10
+max_num_tests = 15
+use_local_sandbox = true
+
+[[orchestrator.train.env]]
+id = "science-env"
+name = "science-env"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.60
+judge_model = "Gemma3"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+judge_api_key_var = "VLLM_API_KEY"
+math_verify_timeout = 5
+
+[[orchestrator.train.env]]
+id = "math-env"
+name = "math-env"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@8_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.60
+judge_model = "Gemma3"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+judge_api_key_var = "VLLM_API_KEY"
+math_verify_timeout = 5
+python_tool = false
+
+[[orchestrator.train.env]]
+id = "logic-env"
+name = "logic-env"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.60
+
+[[orchestrator.train.env]]
+id = "mini-swe-agent-plus"
+name = "mini-swe-agent-plus"
+ratio = 0.5
+group_size = 4
+max_total_completion_tokens = 16384
+timeout = 5400
+
+[orchestrator.train.env.args]
+dataset_name = "R2E-Gym/R2E-Gym-Subset"
+max_turns = 40
+sandbox_command_timeout = 90
+total_timeout_minutes = 360
+test_timeout = 900
+cpu_cores = 4
+memory_gb = 8
+disk_size_gb = 8
+sandbox_client_max_workers = 32
+rollout_timeout_seconds = 5400
+max_command_timeouts = 5
+allow_git = true
+skip_swebench_install = true
+use_local_sandbox = true
+
+[[orchestrator.train.env]]
+id = "ifeval"
+name = "ifeval"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+num_train_examples = -1
+num_eval_examples = 256
+
+[[orchestrator.train.env]]
+id = "nemotron-tool-calling"
+name = "tool-calling-swe-pivot"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "swe_pivot"
+judge_model = "Gemma3"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+judge_api_key_var = "VLLM_API_KEY"
+num_eval_examples = 64
+num_train_examples = 4096
+enable_anti_hacking = true
+anti_hacking_judge_model = "Gemma3"
+enable_native_tool_calls = false
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+enable_structured_marker_gate = false
+anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
+anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
+anti_hacking_format_reward_weight = 0.15
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.train.env]]
+id = "nemotron-instruction-following"
+name = "instruction-hard"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "identity,cfbench,adversarial,inverse_ifeval"
+judge_model = "Gemma3"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+judge_api_key_var = "VLLM_API_KEY"
+num_eval_examples = 64
+num_train_examples = 4096
+enable_anti_hacking = true
+anti_hacking_judge_model = "Gemma3"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+enable_structured_marker_gate = false
+anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
+anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
+anti_hacking_format_reward_weight = 0.10
+
+[[orchestrator.train.env]]
+id = "nemotron-knowledge"
+name = "knowledge-hard"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "qa_abstention,mcqa"
+judge_model = "Gemma3"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+judge_api_key_var = "VLLM_API_KEY"
+num_eval_examples = 64
+num_train_examples = 4096
+enable_task_judges = true
+enable_anti_hacking = true
+anti_hacking_judge_model = "Gemma3"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+enable_structured_marker_gate = false
+anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
+anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
+anti_hacking_format_reward_weight = 0.10
+
+[[orchestrator.train.env]]
+id = "nemotron-reasoning"
+name = "reasoning-hard"
+ratio = 1.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "arc_agi,math,science"
+judge_model = "Gemma3"
+judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+judge_api_key_var = "VLLM_API_KEY"
+num_eval_examples = 64
+num_train_examples = 4096
+enable_task_judges = true
+enable_anti_hacking = true
+anti_hacking_judge_model = "Gemma3"
+enable_anti_hacking_judges = false
+anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
+enable_structured_marker_gate = false
+anti_hacking_judge_api_key_var = "VLLM_API_KEY"
+anti_hacking_judge_timeout = 300
+anti_hacking_judge_max_retries = 2
+anti_hacking_judge_retry_backoff = 1.0
+anti_hacking_reasoning_required = true
+enable_anti_hacking_coherency_judge = false
+anti_hacking_format_reward_weight = 0.10
+
+[[orchestrator.train.env]]
+id = "decensor-env"
+name = "decensor"
+ratio = 4.0
+group_size = 8
+max_total_completion_tokens = 16384
+timeout = 3600
+
+[orchestrator.train.env.args]
+max_turns = 6
+judge_min_p = 0.05
+judge_model = "Gemma3"
+judge_api_key = "dummy-key"
+judge_timeout = 1200
+judge_base_url = ["http://198.13.252.114:40000/v1", "http://72.46.85.157:30121/v1"]
+user_sim_min_p = 0.05
+user_sim_model = "Gemma3"
+turn_decay_ratio = 0.5
+user_sim_api_key = "dummy-key"
+user_sim_timeout = 300
+enable_word_count = true
+judge_temperature = 1.0
+num_eval_examples = 128
+reasoning_enabled = true
+user_sim_base_url = ["http://198.13.252.114:40000/v1", "http://72.46.85.157:30121/v1"]
+num_train_examples = -1
+bucket_styles_ratio = 0.25
+user_sim_max_tokens = 256
+user_sim_temperature = 1.2
+bucket_markdown_ratio = 0.5
+decensor_dataset_name = "data/NewEden-RL-seed-Decensor/rl.jsonl"
+enable_length_prompts = true
+bucket_plaintext_ratio = 0.25
+enable_markdown_judges = true
+enable_meta_commentary = true
+enable_reasoning_trace = true
+max_concurrent_scoring = 8
+enable_structured_markers = true
+enable_reasoning_coherency = true
+meta_commentary_multiplier = 0.01
+markdown_exempt_probability = 0.25
+word_count_tolerance_percent = 0.6
+incoherent_penalty_multiplier = 0.1
+
+[orchestrator.eval]
+interval = 25
+num_examples = 64
+group_size = 1
+skip_first_step = true
+
+[orchestrator.eval.sampling]
+temperature = 0.0
+top_p = 1.0
+max_completion_tokens = 16384
+
+[[orchestrator.eval.env]]
+id = "aime2025"
+name = "primeintellect-aime2025"
+group_size = 8
+num_examples = -1
+
+[[orchestrator.eval.env]]
+id = "aime2024"
+name = "primeintellect-aime2024"
+group_size = 8
+num_examples = -1
+
+[[orchestrator.eval.env]]
+id = "math500"
+name = "primeintellect-math500"
+
+[orchestrator.eval.env.args]
+use_think = true
+
+[[orchestrator.eval.env]]
+id = "gpqa"
+name = "primeintellect-gpqa"
+
+[orchestrator.eval.env.args]
+diamond = true
+verifier = "exact-match"
+
+[[orchestrator.eval.env]]
+id = "ifeval"
+name = "arcee-ifeval-eval"
+
+[orchestrator.eval.env.args]
+num_eval_examples = 64
+
+[[orchestrator.eval.env]]
+id = "mmlu-pro"
+name = "primeintellect-mmlu-pro"
+
+[orchestrator.eval.env.args]
+dataset_split = "test"
+
+[inference]
+gpu_memory_utilization = 0.88
+enable_lora = true
+enable_prefix_caching = true
+max_loras = 8
+max_cpu_loras = 32
+max_lora_rank = 32
+api_server_count = 1
+enable_expert_parallel = true
+
+[inference.model]
+max_model_len = 32768
+tool_call_parser = "None"
+reasoning_parser = "None"
+
+[inference.parallel]
+tp = 1
+dp = 4

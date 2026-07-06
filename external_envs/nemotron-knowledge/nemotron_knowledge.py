@@ -11,7 +11,6 @@ selected sub-datasets:
 from __future__ import annotations
 
 import ast
-import asyncio
 import json
 import os
 import random
@@ -21,15 +20,82 @@ from typing import Any
 import verifiers as vf
 from datasets import Dataset, load_dataset
 from huggingface_hub import hf_hub_download
+from nemotron_knowledge_guardrails import (
+    AntiHackingConfig,
+    compose_system_prompt,
+    guard_env,
+    merge_system_prompt,
+    parse_bool,
+)
 from openai import AsyncOpenAI
 
-from nemotron_knowledge_guardrails import AntiHackingConfig, compose_system_prompt, guard_env, merge_system_prompt, parse_bool
+
+class _RoundRobinChatCompletions:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self._clients = clients
+        self._index = 0
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return await client.chat.completions.create(*args, **kwargs)
+
+
+class _RoundRobinChat:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.completions = _RoundRobinChatCompletions(clients)
+
+
+class _RoundRobinOpenAI:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.chat = _RoundRobinChat(clients)
+
+
+def _normalize_base_urls(base_url: Any) -> list[str]:
+    if base_url is None:
+        return []
+    if isinstance(base_url, str):
+        value = base_url.strip()
+        if value.startswith("["):
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                parsed = value
+            raw_urls = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+        else:
+            raw_urls = [value]
+    elif isinstance(base_url, (list, tuple)):
+        raw_urls = base_url
+    else:
+        raw_urls = [base_url]
+
+    urls: list[str] = []
+    for raw_url in raw_urls:
+        if raw_url is None:
+            continue
+        url = str(raw_url).strip().rstrip("/")
+        if not url:
+            continue
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        urls.append(url)
+    return urls
+
+
+def _openai_client(api_key: str, base_url: Any, http_client: Any = None) -> Any:
+    urls = _normalize_base_urls(base_url)
+    if len(urls) <= 1:
+        return AsyncOpenAI(api_key=api_key, base_url=urls[0] if urls else base_url, http_client=http_client)
+    clients = [AsyncOpenAI(api_key=api_key, base_url=url, http_client=http_client) for url in urls]
+    return _RoundRobinOpenAI(clients)
+
 
 MCQA_DATASET = "nvidia/Nemotron-RL-knowledge-mcqa"
 QA_ABSTENTION_DATASET = "nvidia/Nemotron-RL-QA-Abstention-v1"
 
 MCQA_ANSWER_RE = re.compile(r"Answer\s*:\s*(?!Answer)\s*([A-Za-z0-9])", re.IGNORECASE)
 MCQA_FALLBACK_RE = re.compile(r"\b([A-P])\b\s*$", re.MULTILINE)
+ANSWER_LINE_RE = re.compile(r"^\s*(?:final\s+)?answer\s*[:=]\s*(.+?)\s*$", re.IGNORECASE)
 ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 BOXED_RE = re.compile(r"\\boxed\{(.+?)\}")
 SCORE_TAG_RE = re.compile(r"<score>\s*([01])\s*</score>|<score>\s*([01])", re.IGNORECASE)
@@ -168,6 +234,57 @@ def _last_boxed_content(text: str) -> str | None:
     return None
 
 
+def _use_boxed_format(row_index: int, seed: int) -> bool:
+    return (row_index + seed) % 2 == 0
+
+
+def _message_content(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("content", "") or "")
+    return str(getattr(message, "content", "") or "")
+
+
+def _set_message_content(message: Any, content: str) -> Any:
+    if isinstance(message, dict):
+        updated = dict(message)
+        updated["content"] = content
+        return updated
+    setattr(message, "content", content)
+    return message
+
+
+def _rewrite_mcqa_prompt(prompt: list[dict[str, str]], boxed: bool) -> list[dict[str, str]]:
+    messages = [dict(message) for message in prompt]
+    user_idx = next((idx for idx, msg in enumerate(messages) if str(msg.get("role", "")).lower() == "user"), None)
+    if user_idx is None:
+        return messages
+    content = _message_content(messages[user_idx])
+    labels = re.findall(r"(?m)^([A-P])\s*:", content)
+    choice_spec = "/".join(dict.fromkeys(labels)) or "A/B/C/D"
+    first_choice = labels[0] if labels else "A"
+    if boxed:
+        instruction = (
+            "Answer the following multiple choice question. The last line of your response should be in the "
+            f"following format: 'Answer: \\\\boxed{{{choice_spec}}}' (e.g. 'Answer: \\\\boxed{{{first_choice}}}')."
+        )
+    else:
+        instruction = (
+            "Answer the following multiple choice question. The last line of your response should be in the "
+            f"following format: 'Answer: {choice_spec}' (e.g. 'Answer: {first_choice}')."
+        )
+    content = re.sub(
+        r"\AAnswer the following multiple choice question\..*?(?:\n\s*\n)",
+        instruction + "\n\n",
+        content,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if content == _message_content(messages[user_idx]):
+        content = f"{instruction}\n\n{content}"
+    messages[user_idx] = _set_message_content(messages[user_idx], content)
+    return messages
+
+
 async def _judge_equivalence(
     judge_client: AsyncOpenAI | None,
     judge_model: str,
@@ -209,6 +326,11 @@ async def _judge_equivalence(
 def _mcqa_extract_letter(text: str) -> str:
     if not text:
         return ""
+    boxed = _last_boxed_content(text)
+    if boxed is not None:
+        boxed = boxed.strip().upper()
+        if re.fullmatch(r"[A-P0-9]", boxed):
+            return boxed
     m = MCQA_ANSWER_RE.findall(text)
     if m:
         return m[-1].strip().upper()
@@ -237,11 +359,17 @@ def _build_mcqa(num_examples: int, seed: int, system_prompt: str | None) -> Data
         expected = str(row.get("expected_answer", "")).strip()
         if not prompt or not expected:
             continue
+        boxed = _use_boxed_format(len(rows), seed)
+        prompt = _rewrite_mcqa_prompt(prompt, boxed)
         rows.append(
             {
                 "prompt": prompt,
                 "answer": expected,
-                "info": {"uuid": str(row.get("uuid", "")), "subtask": "mcqa"},
+                "info": {
+                    "uuid": str(row.get("uuid", "")),
+                    "subtask": "mcqa",
+                    "answer_format": "boxed" if boxed else "answer_line",
+                },
             }
         )
     return Dataset.from_list(rows)
@@ -268,6 +396,10 @@ def _extract_response_answer(text: str) -> str:
     boxed = _last_boxed_content(text)
     if boxed is not None:
         return boxed
+    for line in reversed(text.splitlines()):
+        answer_line = ANSWER_LINE_RE.match(line)
+        if answer_line:
+            return answer_line.group(1).strip()
     return text.strip()
 
 
@@ -415,7 +547,7 @@ def load_environment(
     needs_guard_judge = enable_anti_hacking and enable_anti_hacking_judges
     judge_client = None
     if needs_task_judge or needs_guard_judge:
-        judge_client = AsyncOpenAI(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
+        judge_client = _openai_client(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
     guard_config = None
     if enable_anti_hacking:
         guard_client = judge_client
@@ -425,7 +557,7 @@ def load_environment(
         if enable_anti_hacking_judges and (
             guard_client is None or guard_model != judge_model or guard_base_url != judge_base_url
         ):
-            guard_client = AsyncOpenAI(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
+            guard_client = _openai_client(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
         guard_config = AntiHackingConfig(
             judge_client=guard_client if enable_anti_hacking_judges else None,
             judge_model=guard_model,

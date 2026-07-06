@@ -11,7 +11,6 @@ Sub-datasets:
 from __future__ import annotations
 
 import ast
-import asyncio
 import json
 import os
 import random
@@ -22,9 +21,75 @@ import reasoning_gym
 import verifiers as vf
 from datasets import Dataset
 from huggingface_hub import hf_hub_download
+from nemotron_reasoning_guardrails import (
+    AntiHackingConfig,
+    compose_system_prompt,
+    guard_env,
+    merge_system_prompt,
+    parse_bool,
+)
 from openai import AsyncOpenAI
 
-from nemotron_reasoning_guardrails import AntiHackingConfig, compose_system_prompt, guard_env, merge_system_prompt, parse_bool
+
+class _RoundRobinChatCompletions:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self._clients = clients
+        self._index = 0
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return await client.chat.completions.create(*args, **kwargs)
+
+
+class _RoundRobinChat:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.completions = _RoundRobinChatCompletions(clients)
+
+
+class _RoundRobinOpenAI:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.chat = _RoundRobinChat(clients)
+
+
+def _normalize_base_urls(base_url: Any) -> list[str]:
+    if base_url is None:
+        return []
+    if isinstance(base_url, str):
+        value = base_url.strip()
+        if value.startswith("["):
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                parsed = value
+            raw_urls = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+        else:
+            raw_urls = [value]
+    elif isinstance(base_url, (list, tuple)):
+        raw_urls = base_url
+    else:
+        raw_urls = [base_url]
+
+    urls: list[str] = []
+    for raw_url in raw_urls:
+        if raw_url is None:
+            continue
+        url = str(raw_url).strip().rstrip("/")
+        if not url:
+            continue
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        urls.append(url)
+    return urls
+
+
+def _openai_client(api_key: str, base_url: Any, http_client: Any = None) -> Any:
+    urls = _normalize_base_urls(base_url)
+    if len(urls) <= 1:
+        return AsyncOpenAI(api_key=api_key, base_url=urls[0] if urls else base_url, http_client=http_client)
+    clients = [AsyncOpenAI(api_key=api_key, base_url=url, http_client=http_client) for url in urls]
+    return _RoundRobinOpenAI(clients)
+
 
 RG_DATASET = "nvidia/Nemotron-RL-ReasoningGym-v1"
 MATH_DATASET = "nvidia/Nemotron-RL-Math-v2"
@@ -32,6 +97,7 @@ SCIENCE_DATASET = "nvidia/Nemotron-RL-Science-v1"
 ARC_AGI_DATASET = "nvidia/Nemotron-RL-ARC-AGI-v1"
 
 ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+ANSWER_LINE_RE = re.compile(r"^\s*(?:final\s+)?answer\s*[:=]\s*(.+?)\s*$", re.IGNORECASE)
 BOXED_RE = re.compile(r"\\boxed\{(.*?)\}", re.DOTALL)
 JSON_GRID_RE = re.compile(r"(\[\s*\[.*?\]\s*\])", re.DOTALL)
 
@@ -160,6 +226,10 @@ def _extract_final_answer(text: str) -> str:
     boxed = _last_boxed_content(text)
     if boxed is not None:
         return boxed
+    for line in reversed(text.splitlines()):
+        answer_line = ANSWER_LINE_RE.match(line)
+        if answer_line:
+            return answer_line.group(1).strip()
     return text.strip()
 
 
@@ -219,6 +289,61 @@ def _prompt_text(prompt: Any) -> str:
         if role:
             parts.append(f"{role}: {content}")
     return "\n\n".join(parts)
+
+
+def _use_boxed_format(row_index: int, seed: int) -> bool:
+    return (row_index + seed) % 2 == 0
+
+
+def _message_content(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("content", "") or "")
+    return str(getattr(message, "content", "") or "")
+
+
+def _set_message_content(message: Any, content: str) -> Any:
+    if isinstance(message, dict):
+        updated = dict(message)
+        updated["content"] = content
+        return updated
+    setattr(message, "content", content)
+    return message
+
+
+def _strip_final_answer_format_instruction(content: str) -> str:
+    patterns = [
+        r"Make sure your answer is inside\s*\\boxed\s*\{\s*\}\s*\.?",
+        r"The final answer must be placed at the end of your response and enclosed within\s*\\boxed\s*\{\s*\}\s*\.?\s*It is essential to adhere to this format\.?",
+        r"Put your final answer in\s*\\boxed\s*\{\s*\}\s*\.?",
+        r"Express your answer using\s*\\boxed\s*\{\s*\}\s*\.?",
+        r"Provide just the answer inside\s*\\boxed\s*\{\s*\}\s*\.?",
+        r"Give the answer in\s*\\boxed\s*\{\s*\}\s*format\.?",
+        r"Place your final answer in\s*\\boxed\s*\{\s*\}\s*\.?",
+        r"Make sure to use\s*\\boxed\s*\{\s*\}\s*for your answer\.?",
+        r"Conclude with\s*\(Answer:\s*X\),\s*where X is the final answer\.?",
+        r"The last line of your response should be in the following format:\s*'Answer:\s*\\boxed\s*\{.*?\}'\s*\(e\.g\.\s*'.*?'\)\.?",
+        r"[^.\n]*\\boxed\s*\{\s*\}[^.\n]*(?:\.|$)",
+    ]
+    stripped = content
+    for pattern in patterns:
+        stripped = re.sub(pattern, "", stripped, flags=re.IGNORECASE | re.DOTALL)
+    stripped = re.sub(r"[ \t]+\n", "\n", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
+
+
+def _rewrite_final_answer_prompt(prompt: list[dict[str, str]], boxed: bool) -> list[dict[str, str]]:
+    messages = [dict(message) for message in prompt]
+    user_idx = next((idx for idx, msg in enumerate(messages) if str(msg.get("role", "")).lower() == "user"), None)
+    if user_idx is None:
+        return messages
+    content = _strip_final_answer_format_instruction(_message_content(messages[user_idx]))
+    if boxed:
+        instruction = "Put your final answer on the last line as `Answer: \\\\boxed{X}`."
+    else:
+        instruction = "Put your final answer on the last line as `Answer: X`."
+    messages[user_idx] = _set_message_content(messages[user_idx], f"{content}\n\n{instruction}".strip())
+    return messages
 
 
 # --- ReasoningGym ---------------------------------------------------------
@@ -313,6 +438,9 @@ def _build_expected_answer_rows(
         expected = str(row.get("expected_answer") or row.get("answer") or "").strip()
         if not prompt or not expected:
             continue
+        boxed = _use_boxed_format(len(rows), seed) if subtask in {"math", "science"} else True
+        if subtask in {"math", "science"}:
+            prompt = _rewrite_final_answer_prompt(prompt, boxed)
         metadata = _coerce(row.get("metadata"))
         if not isinstance(metadata, dict):
             metadata = {}
@@ -325,6 +453,7 @@ def _build_expected_answer_rows(
                     "verifier_type": str(row.get("verifier_type", "")),
                     "metadata_json": json.dumps(metadata, default=str),
                     "subtask": subtask,
+                    "answer_format": "boxed" if boxed else "answer_line",
                 },
             }
         )
@@ -516,7 +645,7 @@ def load_environment(
     needs_guard_judge = enable_anti_hacking and enable_anti_hacking_judges
     judge_client = None
     if needs_task_judge or needs_guard_judge:
-        judge_client = AsyncOpenAI(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
+        judge_client = _openai_client(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
 
     guard_config = None
     if enable_anti_hacking:
@@ -527,7 +656,7 @@ def load_environment(
         if enable_anti_hacking_judges and (
             guard_client is None or guard_model != judge_model or guard_base_url != judge_base_url
         ):
-            guard_client = AsyncOpenAI(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
+            guard_client = _openai_client(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
         guard_config = AntiHackingConfig(
             judge_client=guard_client if enable_anti_hacking_judges else None,
             judge_model=guard_model,

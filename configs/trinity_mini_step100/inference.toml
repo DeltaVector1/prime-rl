@@ -1,0 +1,49 @@
+enable_lora = true
+max_loras = 8
+max_cpu_loras = 32
+max_lora_rank = 32
+enable_prefix_caching = true
+gpu_memory_utilization = 0.88
+api_server_count = 1
+data_parallel_rpc_port = 13345
+seed = 0
+enable_expert_parallel = true
+all2all_backend = "allgather_reducescatter"
+enable_eplb = false
+enable_dbo = false
+use_deep_gemm = false
+use_pd_kv_transfer = false
+enable_return_routed_experts = false
+enable_fp32_lm_head = true
+
+[server]
+host = "0.0.0.0"
+port = 20000
+liveness_timeout_seconds = 30.0
+
+[model]
+name = "/root/prime/outputs/trinity-mini-cleanblend-32k-cp2-chunk1024/weights/step_100"
+trust_remote_code = false
+dtype = "auto"
+max_model_len = 32768
+enforce_eager = false
+tool_call_parser = "None"
+reasoning_parser = "None"
+
+[parallel]
+tp = 1
+dp = 4
+
+[log]
+level = "info"
+vf_level = "info"
+json_logging = false
+log_data = false
+interval = 10.0
+
+[weight_broadcast]
+type = "filesystem"
+
+[vllm_extra]
+
+[experimental]
