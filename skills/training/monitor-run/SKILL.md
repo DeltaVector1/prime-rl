@@ -130,6 +130,8 @@ For guarded envs, compare `reward/{env}/mean` with `metrics/{env}/task_reward`. 
 | orchestrator | `scheduler/async_level`, `scheduler/inflight_rollouts` | scheduler state |
 | env server | event loop lag (min/mean/p90/p99/max), active task distribution | periodic |
 
+The rollout window is approximately `batch_size * oversampling_factor`. When comparing batch sizes, hold this product constant to isolate batch effects. If the trainer mostly waits for batches while vLLM has no request queue and low KV-cache use, benchmark a larger rollout window before changing completion length or trainer settings.
+
 For live vLLM stats, query Prometheus directly:
 
 ```bash
@@ -147,6 +149,8 @@ curl -s http://localhost:8000/metrics | grep -E "num_requests|gpu_cache_usage"
 ```
 
 The complete audit stream, including trajectory and judge details when enabled, is `{rollout_root}/rollouts.jsonl`.
+
+Count `env_name` in the step JSONL when validating a mixture. Async completion times and pre-batch filtering can make the actual training rows differ materially from the nominal ratios printed in the step summary.
 
 ```bash
 wc -l {rollout_root}/step_42/train_rollouts.jsonl

@@ -1,4 +1,4 @@
-output_dir = "outputs/trinity-mini-step75-decensor-logic-math-science-toolcalling-32k-bsz2048"
+output_dir = "outputs/trinity-mini-step75-decensor-logic-math-science-toolcalling-32k-bsz1024"
 clean_output_dir = true
 max_steps = 200
 seq_len = 32768
@@ -15,7 +15,7 @@ num_infer_gpus = 4
 
 [wandb]
 project = "trinity-mini-prime-rl"
-name = "trinity-mini-step75-decensor-logic-math-science-toolcalling-bsz2048"
+name = "trinity-mini-step75-decensor-logic-math-science-toolcalling-bsz1024"
 
 [ckpt]
 interval = 25
@@ -56,9 +56,9 @@ save_adapter_separately = true
 save_sharded = true
 
 [orchestrator]
-batch_size = 2048
+batch_size = 1024
 group_size = 8
-oversampling_factor = 0.0625
+oversampling_factor = 0.25
 max_off_policy_steps = 8
 tasks_per_minute = 240
 renderer = "None"
@@ -113,6 +113,7 @@ judge_base_url = "http://204.9.206.19:40002/v1"
 user_sim_min_p = 0.05
 user_sim_model = "Gemma3"
 turn_decay_ratio = 0.5
+keep_alive_ratio = 0.07
 user_sim_api_key = "dummy-key"
 user_sim_timeout = 300
 enable_word_count = true
@@ -142,7 +143,7 @@ incoherent_penalty_multiplier = 0.1
 [[orchestrator.train.env]]
 id = "logic-env"
 name = "logic-env"
-ratio = 1.0
+ratio = 1.5
 group_size = 8
 max_total_completion_tokens = 16384
 timeout = 1800
@@ -156,7 +157,7 @@ max_avg_reward = 0.60
 [[orchestrator.train.env]]
 id = "math-env"
 name = "math-env"
-ratio = 1.0
+ratio = 0.9
 group_size = 8
 max_total_completion_tokens = 16384
 timeout = 1800
@@ -175,7 +176,7 @@ python_tool = false
 [[orchestrator.train.env]]
 id = "science-env"
 name = "science-env"
-ratio = 1.0
+ratio = 0.9
 group_size = 8
 max_total_completion_tokens = 16384
 timeout = 1800
@@ -193,7 +194,7 @@ math_verify_timeout = 5
 [[orchestrator.train.env]]
 id = "nemotron-tool-calling"
 name = "tool-calling"
-ratio = 1.0
+ratio = 0.7
 group_size = 8
 max_total_completion_tokens = 16384
 timeout = 1800
