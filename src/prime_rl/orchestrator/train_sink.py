@@ -21,6 +21,7 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.advantage import assign_advantages
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.filters import RolloutFilter, apply_filters
+from prime_rl.orchestrator.token_usage import normalize_token_usage, rollout_token_count
 from prime_rl.orchestrator.trajectories import (
     backfill_rollout_tokens,
     interleave_rollout,
@@ -104,10 +105,7 @@ class TrainSink:
         if self.batch_size is not None:
             return len(self.pending_batch), self.batch_size, "rollouts"
         assert self.token_batch_size is not None
-        tokens = sum(
-            r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
-            for r in self.pending_batch
-        )
+        tokens = sum(rollout_token_count(r.raw) for r in self.pending_batch)
         return tokens, self.token_batch_size, "tokens"
 
     def buffered_count(self) -> int:
@@ -137,11 +135,7 @@ class TrainSink:
         ready = (
             len(self.pending_batch) >= self.batch_size
             if self.batch_size is not None
-            else sum(
-                r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
-                for r in self.pending_batch
-            )
-            >= (self.token_batch_size or 0)
+            else sum(rollout_token_count(r.raw) for r in self.pending_batch) >= (self.token_batch_size or 0)
         )
         if ready:
             return self.process_batch()
@@ -164,6 +158,7 @@ class TrainSink:
             env_name=rollout.env_name,
         )
         rollout.samples = samples or []
+        normalize_token_usage(raw, samples=rollout.samples)
         # Offload base64 image bytes to disk as soon as the rollout is
         # tokenized, so memory stays flat instead of holding every buffered
         # rollout's images until the batch ships (no-op for text-only).
@@ -257,7 +252,7 @@ class TrainSink:
             cut = 0
             running = 0
             for i, r in enumerate(self.pending_batch):
-                running += r.raw["token_usage"]["final_input_tokens"] + r.raw["token_usage"]["final_output_tokens"]
+                running += rollout_token_count(r.raw)
                 cut = i + 1
                 if running >= self.token_batch_size:
                     break

@@ -18,6 +18,7 @@ from collections import defaultdict
 
 from prime_rl.orchestrator.envs import EvalEnvs
 from prime_rl.orchestrator.eval_utils import compute_pass_at_k
+from prime_rl.orchestrator.token_usage import normalize_token_usage, rollout_final_output_tokens
 from prime_rl.orchestrator.types import EvalBatch, EvalBatchMetrics, EvalRollout
 from prime_rl.utils.logger import get_logger
 
@@ -87,6 +88,7 @@ class EvalSink:
         method exists to keep the three-level structure uniform with
         ``TrainSink``.
         """
+        normalize_token_usage(rollout.raw)
         return None
 
     # ── level 2: per-group (move into batch bucket) ───────────────────────
@@ -131,7 +133,7 @@ class EvalSink:
 
         if valid:
             rewards = [r.reward for r in valid]
-            lens = [r.raw["token_usage"]["final_output_tokens"] for r in valid]
+            lens = [rollout_final_output_tokens(r.raw) for r in valid]
             metrics.group_size = self.group_size_for(env_name)
             metrics.reward_mean = float(sum(rewards) / len(rewards))
             metrics.completion_len_mean = float(sum(lens) / len(lens))
