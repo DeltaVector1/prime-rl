@@ -564,22 +564,63 @@ def _ensure_empty_model_response_trajectory(state: vf.State, reason: str) -> Non
 
 def _mark_empty_model_response_zero(state: vf.State, error: vf.EmptyModelResponseError) -> None:
     reason = str(error)
+    _mark_empty_trajectory_zero(state, reason, "empty_model_response_zero_guard")
+
+
+def _empty_trajectory_reason(state: vf.State) -> str:
+    parts = []
+    stop_condition = state.get("stop_condition")
+    if stop_condition:
+        parts.append(f"stop_condition={stop_condition}")
+    if state.get("prompt_too_long"):
+        parts.append("prompt_too_long=True")
+    if state.get("timed_out"):
+        parts.append("timed_out=True")
+    if state.get("final_env_response") is not None:
+        parts.append("final_env_response=True")
+    return ", ".join(parts) or "rollout ended without a model-visible trajectory step"
+
+
+def _mark_empty_trajectory_zero(
+    state: vf.State,
+    reason: str | None = None,
+    stop_condition: str = "empty_trajectory_zero_guard",
+) -> None:
+    reason = reason or _empty_trajectory_reason(state)
     _ensure_empty_model_response_trajectory(state, reason)
     state["error"] = None
     state["reward"] = 0.0
+    trajectory = state.get("trajectory") or []
+    if trajectory:
+        last_step = trajectory[-1]
+        if isinstance(last_step, dict):
+            last_step["reward"] = 0.0
+            extras = dict(last_step.get("extras") or {})
+            extras["empty_trajectory_zero_guard"] = True
+            extras["empty_trajectory_reason"] = reason
+            last_step["extras"] = extras
     state["is_completed"] = True
-    state["stop_condition"] = "empty_model_response_zero_guard"
+    state["stop_condition"] = stop_condition
     breakdown = {
-        "empty_model_response_zero_guard": 1.0,
+        stop_condition: 1.0,
+        "empty_trajectory_zero_guard": 1.0,
+        "empty_model_response_zero_guard": float(stop_condition == "empty_model_response_zero_guard"),
         "empty_model_response_synthetic_step": 1.0,
         "empty_model_response_reasoning_only": float("reasoning but no content" in reason),
         "empty_model_response_reason": reason,
-        "final_reward_formula": "0 because the model returned no visible answer/tool call",
+        "final_reward_formula": "0 because the rollout produced no trainable visible answer/tool-call step",
     }
     state.setdefault("reward_breakdown", {})["empty_model_response_zero_guard"] = breakdown
     metrics = dict(state.get("metrics", {}) or {})
     metrics.update({key: value for key, value in breakdown.items() if isinstance(value, int | float)})
     state["metrics"] = metrics
+
+
+def _mark_errorless_empty_trajectory_zero(state: vf.State) -> bool:
+    if state.get("trajectory") or state.get("error") is not None:
+        return False
+    _mark_empty_trajectory_zero(state)
+    return True
 
 
 class ZeroOnEmptyModelResponseMixin:
@@ -591,10 +632,15 @@ class ZeroOnEmptyModelResponseMixin:
             state["timing"].scoring.end = time.time()
             await self.rubric.cleanup(state)
             return state
+        if _mark_errorless_empty_trajectory_zero(state):
+            state["timing"].scoring.end = time.time()
+            await self.rubric.cleanup(state)
+            return state
         if self.score_rollouts:
             await self.rubric.score_rollout(state)
         else:
             await self.rubric.dummy_score_rollout(state)
+        _mark_errorless_empty_trajectory_zero(state)
         state["timing"].scoring.end = time.time()
         await self.rubric.cleanup(state)
         return state
@@ -606,14 +652,17 @@ class ZeroOnEmptyModelResponseMixin:
 
         start_scoring = time.time()
         empty_errors = []
+        zero_guarded_empty = []
         for state in group_states:
             state["timing"].scoring.start = start_scoring
             error = state.get("error")
             if _is_empty_model_response_error(error):
                 empty_errors.append(error)
+                zero_guarded_empty.append(False)
                 _mark_empty_model_response_zero(state, error)
             else:
                 empty_errors.append(None)
+                zero_guarded_empty.append(_mark_errorless_empty_trajectory_zero(state))
 
         if self.score_rollouts:
             await self.rubric.score_group(group_states)
@@ -621,9 +670,13 @@ class ZeroOnEmptyModelResponseMixin:
             await self.rubric.dummy_score_group(group_states)
 
         end_scoring = time.time()
-        for state, error in zip(group_states, empty_errors, strict=False):
+        for state, error, was_zero_guarded_empty in zip(group_states, empty_errors, zero_guarded_empty, strict=False):
             if error is not None:
                 _mark_empty_model_response_zero(state, error)
+            elif was_zero_guarded_empty:
+                _mark_empty_trajectory_zero(state)
+            else:
+                _mark_errorless_empty_trajectory_zero(state)
             state["timing"].scoring.end = end_scoring
             await self.rubric.cleanup(state)
 
