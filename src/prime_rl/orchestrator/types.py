@@ -140,11 +140,14 @@ class TrainBatchMetrics:
 @dataclass
 class TrainBatch:
     """``samples`` is the trainer-bound payload (post-filter survivors);
-    ``rollouts`` is the full cohort kept for orchestrator-side I/O."""
+    ``rollouts`` is the trainer-cohort kept for orchestrator-side I/O.
+    ``audit_rollouts`` includes every finalized-group rollout observed since
+    the previous shipped batch, including errored and pre-filtered rollouts."""
 
     rollouts: list[TrainRollout]
     samples: list[TrainingSample]
     metrics: TrainBatchMetrics
+    audit_rollouts: list[TrainRollout] = field(default_factory=list)
 
 
 @dataclass

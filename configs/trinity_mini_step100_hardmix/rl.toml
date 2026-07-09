@@ -27,7 +27,7 @@ dist_timeout_seconds = 1800
 
 [trainer.model]
 impl = "custom"
-attn = "flash_attention_3"
+attn = "flash_attention_2"
 ep = 4
 fsdp_cpu_offload = false
 optim_cpu_offload = true
@@ -60,17 +60,12 @@ batch_size = 2048
 group_size = 8
 oversampling_factor = 0.0625
 max_off_policy_steps = 8
-pool_size = 1
 tasks_per_minute = 240
+renderer = "None"
 
 [orchestrator.wandb.log_extras]
 interval = 25
 sample_ratio = 0.02
-
-[orchestrator.renderer]
-name = "default"
-reasoning_parser = "think"
-tool_parser = "qwen3.5"
 
 [orchestrator.train]
 num_workers = 4
@@ -216,10 +211,10 @@ judge_model = "Gemma3"
 judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
-num_train_examples = 4096
+num_train_examples = -1
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
-enable_native_tool_calls = false
+enable_native_tool_calls = true
 enable_anti_hacking_judges = false
 anti_hacking_judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 enable_structured_marker_gate = false
@@ -246,7 +241,7 @@ judge_model = "Gemma3"
 judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
-num_train_examples = 4096
+num_train_examples = -1
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
 enable_anti_hacking_judges = false
@@ -274,7 +269,7 @@ judge_model = "Gemma3"
 judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
-num_train_examples = 4096
+num_train_examples = -1
 enable_task_judges = true
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
@@ -303,7 +298,7 @@ judge_model = "Gemma3"
 judge_base_url = ["http://72.46.85.157:30121/v1", "http://198.13.252.114:40000/v1"]
 judge_api_key_var = "VLLM_API_KEY"
 num_eval_examples = 64
-num_train_examples = 4096
+num_train_examples = -1
 enable_task_judges = true
 enable_anti_hacking = true
 anti_hacking_judge_model = "Gemma3"
@@ -415,7 +410,7 @@ name = "primeintellect-mmlu-pro"
 dataset_split = "test"
 
 [inference]
-gpu_memory_utilization = 0.88
+gpu_memory_utilization = 0.95
 enable_lora = true
 enable_prefix_caching = true
 max_loras = 8
@@ -426,8 +421,8 @@ enable_expert_parallel = true
 
 [inference.model]
 max_model_len = 32768
-tool_call_parser = "None"
-reasoning_parser = "None"
+tool_call_parser = "hermes"
+reasoning_parser = "deepseek_r1"
 
 [inference.parallel]
 tp = 1

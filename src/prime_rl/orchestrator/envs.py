@@ -16,7 +16,19 @@ from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig, TrainEnvConf
 from prime_rl.orchestrator.advantage import AdvantageFn, setup_advantage_fn
 from prime_rl.utils.logger import get_logger
 
-REQUIRED_STATE_COLUMNS = ["trajectory"]
+REQUIRED_STATE_COLUMNS = [
+    "trajectory",
+    "reward_breakdown",
+    "anti_hacking_breakdown",
+    "judge_logs",
+    "judge_response",
+    "judge_result",
+    "judge_score",
+    "math_verify_score",
+    "raw_completion",
+    "python_tool_history",
+    "executed_python_tool_calls",
+]
 
 
 class Env:

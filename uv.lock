@@ -609,7 +609,7 @@ wheels = [
 [[package]]
 name = "code-env"
 version = "0.3.2"
-source = { editable = "external_envs/code-env" }
+source = { editable = "rl_environments/code-env" }
 dependencies = [
     { name = "prime-sandboxes" },
     { name = "verifiers", extra = ["packages"] },
@@ -879,7 +879,7 @@ wheels = [
 [[package]]
 name = "decensor-env"
 version = "0.6.5"
-source = { editable = "external_envs/decensor-env" }
+source = { editable = "rl_environments/decensor-env" }
 dependencies = [
     { name = "datasets" },
     { name = "httpx" },
@@ -1956,7 +1956,7 @@ wheels = [
 [[package]]
 name = "ifeval"
 version = "0.1.1"
-source = { editable = "external_envs/arcee-ifeval" }
+source = { editable = "rl_environments/arcee-ifeval" }
 dependencies = [
     { name = "verifiers", extra = ["packages"] },
 ]
@@ -2527,7 +2527,7 @@ wheels = [
 [[package]]
 name = "logic-env"
 version = "0.1.2"
-source = { editable = "external_envs/logic-env" }
+source = { editable = "rl_environments/logic-env" }
 dependencies = [
     { name = "markdown" },
     { name = "math-verify" },
@@ -2632,7 +2632,7 @@ wheels = [
 [[package]]
 name = "math-env"
 version = "0.1.6"
-source = { editable = "external_envs/math-env" }
+source = { editable = "rl_environments/math-env" }
 dependencies = [
     { name = "math-verify" },
     { name = "prime-sandboxes" },
@@ -2772,7 +2772,7 @@ wheels = [
 [[package]]
 name = "mini-swe-agent-plus"
 version = "0.2.25"
-source = { editable = "external_envs/mini-swe-agent-plus" }
+source = { editable = "rl_environments/mini-swe-agent-plus" }
 dependencies = [
     { name = "prime-sandboxes" },
     { name = "swebench" },
@@ -3036,7 +3036,7 @@ wheels = [
 [[package]]
 name = "nemotron-instruction-following"
 version = "0.5.0"
-source = { editable = "external_envs/nemotron-instruction-following" }
+source = { editable = "rl_environments/nemotron-instruction-following" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
@@ -3064,7 +3064,7 @@ requires-dist = [
 [[package]]
 name = "nemotron-knowledge"
 version = "0.3.0"
-source = { editable = "external_envs/nemotron-knowledge" }
+source = { editable = "rl_environments/nemotron-knowledge" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
@@ -3083,7 +3083,7 @@ requires-dist = [
 [[package]]
 name = "nemotron-reasoning"
 version = "0.2.0"
-source = { editable = "external_envs/nemotron-reasoning" }
+source = { editable = "rl_environments/nemotron-reasoning" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
@@ -3105,8 +3105,8 @@ requires-dist = [
 
 [[package]]
 name = "nemotron-tool-calling"
-version = "0.3.0"
-source = { editable = "external_envs/nemotron-tool-calling" }
+version = "0.4.0"
+source = { editable = "rl_environments/nemotron-tool-calling" }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
@@ -4218,11 +4218,11 @@ requires-dist = [
     { name = "aiolimiter", specifier = ">=1.2.1" },
     { name = "alphabet-sort", marker = "extra == 'envs'", editable = "deps/verifiers/environments/alphabet_sort" },
     { name = "beartype", specifier = ">=0.21.0" },
-    { name = "code-env", editable = "external_envs/code-env" },
-    { name = "code-env", marker = "extra == 'envs'", editable = "external_envs/code-env" },
+    { name = "code-env", editable = "rl_environments/code-env" },
+    { name = "code-env", marker = "extra == 'envs'", editable = "rl_environments/code-env" },
     { name = "color-codeword", marker = "extra == 'envs'", editable = "deps/research-environments/environments/color_codeword" },
     { name = "datasets", specifier = ">=4.0.0" },
-    { name = "decensor-env", editable = "external_envs/decensor-env" },
+    { name = "decensor-env", editable = "rl_environments/decensor-env" },
     { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl" },
     { name = "deep-gemm", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_gemm-2.5.0+891d57b-cp312-cp312-linux_x86_64.whl" },
     { name = "deepdive", marker = "extra == 'envs'", editable = "deps/research-environments/environments/deepdive" },
@@ -4234,28 +4234,28 @@ requires-dist = [
     { name = "general-agent", marker = "extra == 'envs'", editable = "deps/research-environments/environments/general_agent" },
     { name = "gpqa", marker = "extra == 'envs'", editable = "deps/research-environments/environments/gpqa" },
     { name = "hle", marker = "extra == 'envs'", editable = "deps/research-environments/environments/hle" },
-    { name = "ifeval", editable = "external_envs/arcee-ifeval" },
-    { name = "ifeval", marker = "extra == 'envs'", editable = "external_envs/arcee-ifeval" },
+    { name = "ifeval", editable = "rl_environments/arcee-ifeval" },
+    { name = "ifeval", marker = "extra == 'envs'", editable = "rl_environments/arcee-ifeval" },
     { name = "jaxtyping", specifier = ">=0.3.2" },
     { name = "kernels", marker = "extra == 'gpt-oss'" },
     { name = "liger-kernel", specifier = ">=0.5.10" },
     { name = "livecodebench", marker = "extra == 'envs'", editable = "deps/research-environments/environments/livecodebench" },
-    { name = "logic-env", editable = "external_envs/logic-env" },
-    { name = "logic-env", marker = "extra == 'envs'", editable = "external_envs/logic-env" },
+    { name = "logic-env", editable = "rl_environments/logic-env" },
+    { name = "logic-env", marker = "extra == 'envs'", editable = "rl_environments/logic-env" },
     { name = "loguru", specifier = ">=0.7.3" },
-    { name = "math-env", editable = "external_envs/math-env" },
-    { name = "math-env", marker = "extra == 'envs'", editable = "external_envs/math-env" },
+    { name = "math-env", editable = "rl_environments/math-env" },
+    { name = "math-env", marker = "extra == 'envs'", editable = "rl_environments/math-env" },
     { name = "math-python", marker = "extra == 'envs'", editable = "deps/verifiers/environments/math_python" },
     { name = "math500", marker = "extra == 'envs'", editable = "deps/research-environments/environments/math500" },
-    { name = "mini-swe-agent-plus", editable = "external_envs/mini-swe-agent-plus" },
-    { name = "mini-swe-agent-plus", marker = "extra == 'envs'", editable = "external_envs/mini-swe-agent-plus" },
+    { name = "mini-swe-agent-plus", editable = "rl_environments/mini-swe-agent-plus" },
+    { name = "mini-swe-agent-plus", marker = "extra == 'envs'", editable = "rl_environments/mini-swe-agent-plus" },
     { name = "mmlu-pro", marker = "extra == 'envs'", editable = "deps/research-environments/environments/mmlu_pro" },
     { name = "modelexpress", marker = "extra == 'modelexpress'", specifier = "==0.3.0" },
     { name = "mooncake-transfer-engine", specifier = ">=0.3.10.post2" },
-    { name = "nemotron-instruction-following", editable = "external_envs/nemotron-instruction-following" },
-    { name = "nemotron-knowledge", editable = "external_envs/nemotron-knowledge" },
-    { name = "nemotron-reasoning", editable = "external_envs/nemotron-reasoning" },
-    { name = "nemotron-tool-calling", editable = "external_envs/nemotron-tool-calling" },
+    { name = "nemotron-instruction-following", editable = "rl_environments/nemotron-instruction-following" },
+    { name = "nemotron-knowledge", editable = "rl_environments/nemotron-knowledge" },
+    { name = "nemotron-reasoning", editable = "rl_environments/nemotron-reasoning" },
+    { name = "nemotron-tool-calling", editable = "rl_environments/nemotron-tool-calling" },
     { name = "nixl", marker = "extra == 'disagg'" },
     { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" },
     { name = "numpy", specifier = ">=2.2.6" },
@@ -4286,8 +4286,8 @@ requires-dist = [
     { name = "rlm-search", marker = "extra == 'envs'", editable = "deps/research-environments/environments/rlm_search" },
     { name = "rlm-swe", marker = "extra == 'envs'", editable = "deps/research-environments/environments/rlm_swe" },
     { name = "rlm-uuid-ctf", marker = "extra == 'envs'", editable = "deps/research-environments/environments/rlm_uuid_ctf" },
-    { name = "science-env", editable = "external_envs/science-env" },
-    { name = "science-env", marker = "extra == 'envs'", editable = "external_envs/science-env" },
+    { name = "science-env", editable = "rl_environments/science-env" },
+    { name = "science-env", marker = "extra == 'envs'", editable = "rl_environments/science-env" },
     { name = "setproctitle", specifier = ">=1.3.0" },
     { name = "simpleqa-verified", marker = "extra == 'envs'", editable = "deps/research-environments/environments/simpleqa_verified" },
     { name = "tau2-bench", marker = "extra == 'envs'", editable = "deps/research-environments/environments/tau2_bench" },
@@ -5238,7 +5238,7 @@ wheels = [
 [[package]]
 name = "science-env"
 version = "0.1.4"
-source = { editable = "external_envs/science-env" }
+source = { editable = "rl_environments/science-env" }
 dependencies = [
     { name = "math-verify" },
     { name = "verifiers", extra = ["packages"] },

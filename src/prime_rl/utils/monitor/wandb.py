@@ -243,5 +243,9 @@ class WandbMonitor(Monitor):
         assert self.output_dir is not None, "Output directory is required for saving final summary"
         dir_path = self.output_dir / f"run-{self.wandb.id}"
         dir_path.mkdir(parents=True, exist_ok=True)
+        try:
+            summary_dict = wandb.summary._as_dict()
+        except (AttributeError, KeyError):
+            summary_dict = dict(wandb.summary)
         with open(dir_path / filename, "w") as f:
-            json.dump(wandb.summary._as_dict(), f)
+            json.dump(summary_dict, f, default=str)

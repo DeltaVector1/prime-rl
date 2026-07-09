@@ -24,7 +24,9 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 import tomli_w
 
@@ -65,6 +67,7 @@ from prime_rl.orchestrator.types import (
     TrainRollout,
 )
 from prime_rl.orchestrator.utils import (
+    append_jsonl_records,
     compute_teacher_logprobs,
     get_weight_dir,
     intercept_vf_logging,
@@ -591,10 +594,10 @@ class Orchestrator:
         # Materialize at the I/O boundary so prime-rl metadata travels with
         # the raw vf payload on disk + in wandb sample tables
         rollout_dicts = [r.to_dict() for r in batch.rollouts]
+        audit_rollouts = batch.audit_rollouts or batch.rollouts
+        audit_rollout_dicts = [r.to_dict() for r in audit_rollouts]
         step_path = get_step_path(get_rollout_dir(config.output_dir), step)
-        await asyncio.to_thread(
-            save_rollouts, rollout_dicts, step_path / "train_rollouts.jsonl", exclude_keys={"trajectory"}
-        )
+        await asyncio.to_thread(save_rollouts, rollout_dicts, step_path / "train_rollouts.jsonl")
 
         teacher_logprobs_time = 0.0  # opd only
         if config.training_mode == "opd" and self.teacher_inference is not None:
@@ -625,6 +628,17 @@ class Orchestrator:
             pre_filter_dropped=self.train_sink.pre_filter_dropped,
             pre_filter_dropped_by_name=dict(self.train_sink.pre_filter_dropped_by_name),
         )
+        audit_records = self.build_train_audit_records(
+            batch=batch,
+            audit_rollouts=audit_rollouts,
+            audit_rollout_dicts=audit_rollout_dicts,
+            step=step,
+            step_time=step_time,
+            save_ckpt_time=save_ckpt_time,
+            teacher_logprobs_time=teacher_logprobs_time,
+            logged_metrics=metrics,
+        )
+        await asyncio.to_thread(append_jsonl_records, audit_records, self.rollout_audit_path())
         self.monitor.log(metrics, step=step)
         self.monitor.log_samples(rollout_dicts, step=step)
         self.monitor.log_distributions(
@@ -661,6 +675,267 @@ class Orchestrator:
         self.train_sink.reset_pre_filter_stats()
         self.progress.step += 1
         self.maybe_trigger_eval(self.progress.step)
+
+    def rollout_audit_path(self):
+        return get_rollout_dir(self.config.output_dir) / "rollouts.jsonl"
+
+    @staticmethod
+    def audit_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def error_label(error: object) -> str | None:
+        if error is None:
+            return None
+        if isinstance(error, dict):
+            for key in ("error_type", "exception_type", "type", "class", "message"):
+                value = error.get(key)
+                if value:
+                    return str(value)
+            chain = error.get("error_chain_repr")
+            if chain:
+                return str(chain)
+        return type(error).__name__
+
+    @staticmethod
+    def rollout_judge_logs(rollout: dict[str, Any]) -> list[Any]:
+        logs = rollout.get("judge_logs")
+        if isinstance(logs, list):
+            return logs
+        judge_response = rollout.get("judge_response")
+        if isinstance(judge_response, dict):
+            return [
+                {
+                    "kind": "judge_response",
+                    "prompt": prompt,
+                    "response": response,
+                }
+                for prompt, response in judge_response.items()
+            ]
+        reward_breakdown = rollout.get("reward_breakdown")
+        if isinstance(reward_breakdown, dict):
+            decensor = reward_breakdown.get("decensor")
+            if isinstance(decensor, dict) and isinstance(decensor.get("judge_logs"), list):
+                return decensor["judge_logs"]
+        return []
+
+    @staticmethod
+    def rollout_reward_calculation(rollout: dict[str, Any]) -> dict[str, Any]:
+        reward_breakdown = rollout.get("reward_breakdown")
+        anti_hacking = rollout.get("anti_hacking_breakdown")
+        formulas: list[str] = []
+        components: dict[str, Any] = {}
+        if isinstance(anti_hacking, dict):
+            components["anti_hacking"] = anti_hacking
+            formula = anti_hacking.get("final_reward_formula")
+            if formula:
+                formulas.append(str(formula))
+        if isinstance(reward_breakdown, dict):
+            components["reward_breakdown"] = reward_breakdown
+            for value in reward_breakdown.values():
+                if isinstance(value, dict) and value.get("final_reward_formula"):
+                    formulas.append(str(value["final_reward_formula"]))
+        out: dict[str, Any] = {
+            "reward": rollout.get("reward"),
+            "advantage": rollout.get("advantage"),
+            "metrics": rollout.get("metrics") or {},
+            "judge_result": rollout.get("judge_result"),
+            "judge_score": rollout.get("judge_score"),
+            "math_verify_score": rollout.get("math_verify_score"),
+            "final_reward_formulas": formulas,
+            "components": components,
+        }
+        return out
+
+    def train_drop_reason(
+        self,
+        rollout: TrainRollout,
+        *,
+        in_train_batch: bool,
+        group_rollouts: list[TrainRollout],
+    ) -> str | None:
+        if rollout.error is not None:
+            return "rollout_error"
+        if in_train_batch and rollout.is_filtered:
+            return "post_batch_filter"
+        if in_train_batch:
+            return None
+        try:
+            group_scored_partial = self.train_envs.get(rollout.env_name).requires_group_scoring and any(
+                peer.error is not None for peer in group_rollouts
+            )
+        except Exception:
+            group_scored_partial = False
+        if group_scored_partial:
+            return "group_scored_partial_error"
+        if rollout.is_filtered:
+            return "pre_batch_filter"
+        return "not_in_trainer_batch"
+
+    def build_train_audit_records(
+        self,
+        *,
+        batch: TrainBatch,
+        audit_rollouts: list[TrainRollout],
+        audit_rollout_dicts: list[dict[str, Any]],
+        step: int,
+        step_time: float,
+        save_ckpt_time: float,
+        teacher_logprobs_time: float,
+        logged_metrics: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        created_at = self.audit_timestamp()
+        batch_ids = {str(r.rollout_id) for r in batch.rollouts}
+        trainable_ids = {str(r.rollout_id) for r in batch.rollouts if r.error is None and not r.is_filtered}
+        rollout_by_id = {str(r.rollout_id): data for r, data in zip(audit_rollouts, audit_rollout_dicts)}
+
+        group_rollouts: dict[str, list[TrainRollout]] = defaultdict(list)
+        for rollout in audit_rollouts:
+            group_rollouts[str(rollout.group_id)].append(rollout)
+
+        entries: list[tuple[TrainRollout, dict[str, Any], dict[str, Any]]] = []
+        drop_counts: dict[str, int] = defaultdict(int)
+        for rollout in audit_rollouts:
+            rollout_id = str(rollout.rollout_id)
+            in_train_batch = rollout_id in batch_ids
+            drop_reason = self.train_drop_reason(
+                rollout,
+                in_train_batch=in_train_batch,
+                group_rollouts=group_rollouts[str(rollout.group_id)],
+            )
+            if drop_reason:
+                drop_counts[drop_reason] += 1
+            labels = {
+                "env_name": rollout.env_name,
+                "example_id": rollout.example_id,
+                "group_id": str(rollout.group_id),
+                "rollout_id": rollout_id,
+                "policy_version": rollout.policy_version,
+                "off_policy_steps": rollout.off_policy_steps,
+                "in_train_batch": in_train_batch,
+                "is_trainable": rollout_id in trainable_ids,
+                "is_filtered": rollout.is_filtered,
+                "filters": dict(rollout.filter_results),
+                "drop_reason": drop_reason,
+                "error_type": self.error_label(rollout.error),
+                "is_truncated": rollout.is_truncated,
+                "stop_condition": rollout.raw.get("stop_condition"),
+            }
+            entries.append((rollout, rollout_by_id.get(rollout_id, rollout.to_dict()), labels))
+
+        batch_reward_sum = sum(r.reward for r in batch.rollouts)
+        batch_count = len(batch.rollouts)
+        batch_reward_mean = batch_reward_sum / batch_count if batch_count else 0.0
+
+        batch_groups: dict[str, list[TrainRollout]] = defaultdict(list)
+        for rollout in batch.rollouts:
+            batch_groups[str(rollout.group_id)].append(rollout)
+        group_summaries: list[dict[str, Any]] = []
+        for group_id, rollouts in sorted(batch_groups.items()):
+            rewards = [r.reward for r in rollouts]
+            reward_sum = sum(rewards)
+            group_summaries.append(
+                {
+                    "group_id": group_id,
+                    "env_name": rollouts[0].env_name if rollouts else None,
+                    "example_id": rollouts[0].example_id if rollouts else None,
+                    "rollout_count": len(rollouts),
+                    "reward_sum": reward_sum,
+                    "reward_mean": reward_sum / len(rollouts) if rollouts else 0.0,
+                    "rewards": rewards,
+                    "trainable_count": sum(1 for r in rollouts if not r.is_filtered and r.error is None),
+                    "filtered_count": sum(1 for r in rollouts if r.is_filtered),
+                }
+            )
+        wandb_group_mean = (
+            sum(group["reward_mean"] for group in group_summaries) / len(group_summaries)
+            if group_summaries
+            else 0.0
+        )
+
+        env_names = sorted(set(batch.metrics.arrivals_by_env) | {r.env_name for r in audit_rollouts})
+        by_env: dict[str, Any] = {}
+        for env_name in env_names:
+            env_entries = [(r, labels) for r, _data, labels in entries if r.env_name == env_name]
+            env_batch = [r for r in batch.rollouts if r.env_name == env_name]
+            reward_values = [r.reward for r in env_batch]
+            by_env[env_name] = {
+                "arrivals": batch.metrics.arrivals_by_env.get(env_name, 0),
+                "errors": batch.metrics.errors_by_env.get(env_name, 0),
+                "audited_rollouts": len(env_entries),
+                "train_batch_rollouts": len(env_batch),
+                "trainable": sum(1 for r in env_batch if r.error is None and not r.is_filtered),
+                "filtered": sum(1 for _r, labels in env_entries if labels.get("is_filtered")),
+                "truncated": sum(1 for r, _labels in env_entries if r.is_truncated),
+                "reward_sum": sum(reward_values),
+                "reward_mean": (sum(reward_values) / len(reward_values)) if reward_values else 0.0,
+                "drop_counts": {
+                    reason: sum(1 for _r, labels in env_entries if labels.get("drop_reason") == reason)
+                    for reason in sorted({str(labels.get("drop_reason")) for _r, labels in env_entries if labels.get("drop_reason")})
+                },
+            }
+
+        summary = {
+            "record_type": "train_batch_summary",
+            "schema_version": 1,
+            "kind": "train",
+            "step": step,
+            "created_at": created_at,
+            "output_dir": str(self.config.output_dir),
+            "counts": {
+                "arrivals": sum(batch.metrics.arrivals_by_env.values()),
+                "audited_rollouts": len(audit_rollouts),
+                "train_batch_rollouts": batch_count,
+                "trainable_rollouts": batch.metrics.n_trainable,
+                "samples_shipped": batch.metrics.samples_shipped,
+                "errors": sum(batch.metrics.errors_by_env.values()),
+                "pre_filter_seen": self.train_sink.pre_filter_seen,
+                "pre_filter_dropped": self.train_sink.pre_filter_dropped,
+                "drop_counts": dict(drop_counts),
+            },
+            "reward_mean_calculation": {
+                "console_step_reward": {
+                    "formula": "sum(reward for rollout in train_batch_rollouts) / len(train_batch_rollouts)",
+                    "reward_sum": batch_reward_sum,
+                    "rollout_count": batch_count,
+                    "mean": batch_reward_mean,
+                },
+                "wandb_reward_all_mean": {
+                    "formula": "mean(mean(reward for rollouts in group) for group in train_batch_groups)",
+                    "group_count": len(group_summaries),
+                    "mean": wandb_group_mean,
+                    "logged_value": logged_metrics.get("reward/all/mean"),
+                },
+                "groups": group_summaries,
+            },
+            "filters": {
+                "pre_batch_dropped_by_name": dict(self.train_sink.pre_filter_dropped_by_name),
+            },
+            "timing": {
+                "step": step_time,
+                "save_ckpt": save_ckpt_time,
+                "teacher_logprobs": teacher_logprobs_time,
+            },
+            "by_env": by_env,
+            "logged_metrics": logged_metrics,
+        }
+
+        records = [summary]
+        for rollout, rollout_data, labels in entries:
+            records.append(
+                {
+                    "record_type": "rollout",
+                    "schema_version": 1,
+                    "kind": "train",
+                    "step": step,
+                    "created_at": created_at,
+                    "labels": labels,
+                    "reward_calculation": self.rollout_reward_calculation(rollout_data),
+                    "judge_logs": self.rollout_judge_logs(rollout_data),
+                    "rollout": rollout_data,
+                }
+            )
+        return records
 
     def maybe_trigger_eval(self, step: int) -> None:
         """Fire eligible eval epochs and flip to ``PREFER_EVAL`` if anything
@@ -795,6 +1070,62 @@ class Orchestrator:
             )
         get_logger().success("\n\t\t ".join(lines))
 
+    def build_eval_audit_records(self, *, batch: EvalBatch, rollout_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        created_at = self.audit_timestamp()
+        reward_sum = sum(r.reward for r in batch.rollouts)
+        rollout_count = len(batch.rollouts)
+        summary = {
+            "record_type": "eval_batch_summary",
+            "schema_version": 1,
+            "kind": "eval",
+            "step": batch.step,
+            "env_name": batch.env_name,
+            "created_at": created_at,
+            "output_dir": str(self.config.output_dir),
+            "counts": {
+                "rollouts": rollout_count,
+                "cancelled": batch.metrics.n_cancelled,
+                "errored": batch.metrics.n_errored,
+                "examples": batch.metrics.n_examples,
+                "group_size": batch.metrics.group_size,
+            },
+            "reward_mean_calculation": {
+                "formula": "eval sink reward_mean over completed examples",
+                "rollout_reward_sum": reward_sum,
+                "rollout_count": rollout_count,
+                "rollout_mean": reward_sum / rollout_count if rollout_count else 0.0,
+                "logged_value": batch.metrics.reward_mean,
+            },
+            "metrics": batch.metrics.to_wandb_dict(env_name=batch.env_name, step=batch.step),
+        }
+        records: list[dict[str, Any]] = [summary]
+        for rollout, rollout_data in zip(batch.rollouts, rollout_dicts):
+            records.append(
+                {
+                    "record_type": "rollout",
+                    "schema_version": 1,
+                    "kind": "eval",
+                    "step": batch.step,
+                    "created_at": created_at,
+                    "labels": {
+                        "env_name": rollout.env_name,
+                        "example_id": rollout.example_id,
+                        "group_id": str(rollout.group_id),
+                        "rollout_id": str(rollout.rollout_id),
+                        "policy_version": rollout.policy_version,
+                        "off_policy_steps": rollout.off_policy_steps,
+                        "eval_step": rollout.eval_step,
+                        "error_type": self.error_label(rollout.error),
+                        "is_truncated": rollout.is_truncated,
+                        "stop_condition": rollout.raw.get("stop_condition"),
+                    },
+                    "reward_calculation": self.rollout_reward_calculation(rollout_data),
+                    "judge_logs": self.rollout_judge_logs(rollout_data),
+                    "rollout": rollout_data,
+                }
+            )
+        return records
+
     async def finalize_eval_batch(self, batch: EvalBatch) -> None:
         """Persist + log one completed eval epoch (save_rollouts,
         monitor.log_eval_samples, monitor.log)."""
@@ -808,7 +1139,11 @@ class Orchestrator:
             save_rollouts,
             rollout_dicts,
             step_path / f"eval_rollouts_{batch.env_name}.jsonl",
-            exclude_keys={"trajectory"},
+        )
+        await asyncio.to_thread(
+            append_jsonl_records,
+            self.build_eval_audit_records(batch=batch, rollout_dicts=rollout_dicts),
+            self.rollout_audit_path(),
         )
         self.monitor.log_eval_samples(rollout_dicts, env_name=batch.env_name, step=batch.step)
         policy_versions = {r.policy_version for r in batch.rollouts}

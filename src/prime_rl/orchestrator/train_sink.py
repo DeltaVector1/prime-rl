@@ -65,6 +65,7 @@ class TrainSink:
         # earlier group is still in flight
         self.pending_groups: dict[uuid.UUID, list[TrainRollout]] = defaultdict(list)
         self.pending_batch: list[TrainRollout] = []
+        self.audit_rollouts: list[TrainRollout] = []
 
         # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
         self.pre_filter_seen = 0
@@ -177,6 +178,7 @@ class TrainSink:
             return
         env_name = group[0].env_name
         example_id = group[0].example_id
+        self.audit_rollouts.extend(group)
         survivors = [r for r in group if r.error is None]
         num_errored = len(group) - len(survivors)
 
@@ -290,6 +292,8 @@ class TrainSink:
             num_decode += decode
 
         n_trainable = sum(1 for r in cohort if not r.is_filtered)
+        audit_rollouts = self.audit_rollouts
+        self.audit_rollouts = []
 
         metrics = TrainBatchMetrics(
             n_trainable=n_trainable,
@@ -304,7 +308,7 @@ class TrainSink:
         )
         self.arrivals_by_env.clear()
         self.errors_by_env.clear()
-        return TrainBatch(rollouts=cohort, samples=samples, metrics=metrics)
+        return TrainBatch(rollouts=cohort, samples=samples, metrics=metrics, audit_rollouts=audit_rollouts)
 
     def reset_pre_filter_stats(self) -> None:
         self.pre_filter_seen = 0
