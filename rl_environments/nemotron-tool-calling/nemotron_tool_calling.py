@@ -16,6 +16,7 @@ instead of visible JSON code blocks.
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 import re
@@ -597,6 +598,36 @@ class ZeroOnEmptyModelResponseMixin:
         state["timing"].scoring.end = time.time()
         await self.rubric.cleanup(state)
         return state
+
+    async def _run_group_states(self, group_inputs, client, model: str, sampling_args):
+        group_states = await asyncio.gather(
+            *[self.rollout(input, client, model, sampling_args) for input in group_inputs]
+        )
+
+        start_scoring = time.time()
+        empty_errors = []
+        for state in group_states:
+            state["timing"].scoring.start = start_scoring
+            error = state.get("error")
+            if _is_empty_model_response_error(error):
+                empty_errors.append(error)
+                _mark_empty_model_response_zero(state, error)
+            else:
+                empty_errors.append(None)
+
+        if self.score_rollouts:
+            await self.rubric.score_group(group_states)
+        else:
+            await self.rubric.dummy_score_group(group_states)
+
+        end_scoring = time.time()
+        for state, error in zip(group_states, empty_errors, strict=False):
+            if error is not None:
+                _mark_empty_model_response_zero(state, error)
+            state["timing"].scoring.end = end_scoring
+            await self.rubric.cleanup(state)
+
+        return group_states
 
 
 class DatasetToolCallingEnv(ZeroOnEmptyModelResponseMixin, vf.MultiTurnEnv):
