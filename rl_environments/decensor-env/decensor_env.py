@@ -1365,6 +1365,8 @@ def _split_disjoint_dataset(
         raise ValueError("num_train_examples must be non-negative or None")
     if num_eval_examples < 0:
         raise ValueError("num_eval_examples must be non-negative")
+    if "example_id" not in dataset.column_names:
+        dataset = dataset.add_column("example_id", range(len(dataset)))
     if num_eval_examples == 0:
         train_count = len(dataset) if num_train_examples is None else num_train_examples
         if train_count > len(dataset):
