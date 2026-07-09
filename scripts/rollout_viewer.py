@@ -5,6 +5,7 @@ import argparse
 import html
 import json
 import sys
+import threading
 from collections import Counter, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -298,7 +299,7 @@ def summarize_record(line: int, record: dict[str, Any]) -> dict[str, Any]:
         title_parts.append(" ".join(f"{k}={v}" for k, v in list(counts.items())[:4]))
     elif rollout.get("error"):
         title_parts.append(f"error={labels.get('error_type') or 'yes'}")
-    return {
+    summary = {
         "line": line,
         "record_type": record_type,
         "kind": record.get("kind"),
@@ -309,32 +310,133 @@ def summarize_record(line: int, record: dict[str, Any]) -> dict[str, Any]:
         "drop_reason": labels.get("drop_reason"),
         "judge_logs_count": len(record_judge_logs(record)),
     }
+    summary["_search"] = json.dumps(
+        {
+            "title": summary["title"],
+            "record_type": summary["record_type"],
+            "kind": summary["kind"],
+            "env_name": summary["env_name"],
+            "step": summary["step"],
+            "labels": labels,
+            "reward_calculation": record.get("reward_calculation"),
+        },
+        default=str,
+    ).lower()
+    return summary
 
 
-def record_matches(record: dict[str, Any], filters: dict[str, str]) -> bool:
-    if filters.get("kind") and str(record.get("kind", "")) != filters["kind"]:
+def summary_matches(summary: dict[str, Any], filters: dict[str, str]) -> bool:
+    if filters.get("kind") and str(summary.get("kind", "")) != filters["kind"]:
         return False
-    if filters.get("type") and str(record.get("record_type", "")) != filters["type"]:
+    if filters.get("type") and str(summary.get("record_type", "")) != filters["type"]:
         return False
-    if filters.get("env") and filters["env"].lower() not in str(record_env(record) or "").lower():
+    if filters.get("env") and filters["env"].lower() not in str(summary.get("env_name") or "").lower():
         return False
-    if filters.get("step") and str(record.get("step", "")) != filters["step"]:
+    if filters.get("step") and str(summary.get("step", "")) != filters["step"]:
         return False
-    q = filters.get("q", "").lower()
-    if q:
-        haystack = json.dumps(
-            {
-                "record_type": record.get("record_type"),
-                "kind": record.get("kind"),
-                "env": record_env(record),
-                "labels": record.get("labels"),
-                "reward_calculation": record.get("reward_calculation"),
-            },
-            default=str,
-        ).lower()
-        if q not in haystack:
-            return False
-    return True
+    return not filters.get("q") or filters["q"].lower() in str(summary.get("_search") or "")
+
+
+class RolloutStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.identity: tuple[int, int] | None = None
+        self.position = 0
+        self.summaries: list[dict[str, Any]] = []
+        self.counts: Counter[str] = Counter()
+        self.envs: Counter[str] = Counter()
+
+    def _reset(self, identity: tuple[int, int]) -> None:
+        self.identity = identity
+        self.position = 0
+        self.summaries.clear()
+        self.counts.clear()
+        self.envs.clear()
+
+    def refresh(self) -> None:
+        with self.lock:
+            if not self.path.exists():
+                self.path = resolve_jsonl_path(self.path)
+                if not self.path.exists():
+                    return
+            stat = self.path.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            if identity != self.identity or stat.st_size < self.position:
+                self._reset(identity)
+
+            with open(self.path, "rb") as handle:
+                handle.seek(self.position)
+                while True:
+                    offset = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        self.position = handle.tell()
+                        break
+                    if not raw_line.endswith(b"\n"):
+                        self.position = offset
+                        break
+
+                    line_no = len(self.summaries) + 1
+                    try:
+                        record = json.loads(raw_line)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        record = {
+                            "record_type": "parse_error",
+                            "error": repr(exc),
+                            "raw_line": raw_line[:2000].decode("utf-8", errors="replace"),
+                        }
+                    summary = summarize_record(line_no, record)
+                    summary["_offset"] = offset
+                    self.summaries.append(summary)
+                    record_type = str(record.get("record_type", "unknown"))
+                    self.counts[record_type] += 1
+                    env_name = record_env(record)
+                    if env_name:
+                        self.envs[str(env_name)] += 1
+                    self.position = handle.tell()
+
+    def stats(self) -> dict[str, Any]:
+        self.refresh()
+        with self.lock:
+            return {
+                "file": str(self.path),
+                "total_lines": len(self.summaries),
+                "rollouts": self.counts.get("rollout", 0),
+                "summaries": sum(value for key, value in self.counts.items() if key.endswith("summary")),
+                "record_types": self.counts,
+                "envs": self.envs,
+            }
+
+    def records(self, filters: dict[str, str], limit: int) -> dict[str, Any]:
+        self.refresh()
+        rows = deque(maxlen=max(1, min(limit, 2000)))
+        matched = 0
+        with self.lock:
+            for summary in self.summaries:
+                if not summary_matches(summary, filters):
+                    continue
+                matched += 1
+                rows.append({key: value for key, value in summary.items() if not key.startswith("_")})
+            return {
+                "total_lines": len(self.summaries),
+                "total_matched": matched,
+                "records": list(rows),
+            }
+
+    def record(self, line: int) -> dict[str, Any] | None:
+        self.refresh()
+        with self.lock:
+            if line <= 0 or line > len(self.summaries):
+                return None
+            offset = int(self.summaries[line - 1]["_offset"])
+            with open(self.path, "rb") as handle:
+                handle.seek(offset)
+                record = json.loads(handle.readline())
+            record["line"] = line
+            if "judge_logs" not in record:
+                record["judge_logs"] = record_judge_logs(record)
+            return record
 
 
 class ViewerHandler(BaseHTTPRequestHandler):
@@ -344,8 +446,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     @property
-    def jsonl_path(self) -> Path:
-        return self.server.jsonl_path  # type: ignore[attr-defined]
+    def rollout_store(self) -> RolloutStore:
+        return self.server.rollout_store  # type: ignore[attr-defined]
 
     def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -380,71 +482,35 @@ class ViewerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_json({"error": repr(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
-    def iter_records(self):
-        if not self.jsonl_path.exists():
-            return
-        with open(self.jsonl_path, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield line_no, json.loads(line)
-                except json.JSONDecodeError as exc:
-                    yield line_no, {"record_type": "parse_error", "error": repr(exc), "raw_line": line[:2000]}
-
     def api_stats(self) -> dict[str, Any]:
-        counts = Counter()
-        envs = Counter()
-        total = 0
-        for _line, record in self.iter_records():
-            total += 1
-            rtype = str(record.get("record_type", "unknown"))
-            counts[rtype] += 1
-            env_name = record_env(record)
-            if env_name:
-                envs[str(env_name)] += 1
-        return {
-            "file": str(self.jsonl_path),
-            "total_lines": total,
-            "rollouts": counts.get("rollout", 0),
-            "summaries": sum(v for k, v in counts.items() if k.endswith("summary")),
-            "record_types": counts,
-            "envs": envs,
-        }
+        return self.rollout_store.stats()
 
     def api_records(self, query: dict[str, list[str]]) -> dict[str, Any]:
         limit = int(query.get("limit", ["250"])[0])
         filters = {key: values[0] for key, values in query.items() if values and key != "limit"}
-        rows = deque(maxlen=max(1, min(limit, 2000)))
-        total = 0
-        matched = 0
-        for line_no, record in self.iter_records():
-            total += 1
-            if not record_matches(record, filters):
-                continue
-            matched += 1
-            rows.append(summarize_record(line_no, record))
-        return {"total_lines": total, "total_matched": matched, "records": list(rows)}
+        return self.rollout_store.records(filters, limit)
 
     def api_record(self, query: dict[str, list[str]]) -> dict[str, Any]:
         line = int(query.get("line", ["0"])[0])
         if line <= 0:
             return {"error": "line must be positive"}
-        for line_no, record in self.iter_records():
-            if line_no == line:
-                record["line"] = line_no
-                if "judge_logs" not in record:
-                    record["judge_logs"] = record_judge_logs(record)
-                return {"record": record}
-        return {"error": f"line {line} not found"}
+        record = self.rollout_store.record(line)
+        return {"record": record} if record is not None else {"error": f"line {line} not found"}
+
+
+def resolve_jsonl_path(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if resolved.exists() or resolved.name != "rollouts.jsonl":
+        return resolved
+    candidates = list(resolved.parent.parent.glob("*/rollouts/rollouts.jsonl"))
+    return candidates[0].resolve() if len(candidates) == 1 else resolved
 
 
 def main() -> int:
     args = parse_args()
-    path = args.file.expanduser().resolve()
+    path = resolve_jsonl_path(args.file)
     server = ThreadingHTTPServer((args.host, args.port), ViewerHandler)
-    server.jsonl_path = path  # type: ignore[attr-defined]
+    server.rollout_store = RolloutStore(path)  # type: ignore[attr-defined]
     shown_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
     print(f"Serving {html.escape(str(path))} at http://{shown_host}:{args.port}/")
     try:

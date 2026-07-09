@@ -1,6 +1,6 @@
 [project]
 name = "decensor-env"
-version = "0.7.0"
+version = "0.7.1"
 description = "Decensor env with user-simulated multi-turn rollouts, prompt-style buckets, geometric turn-count decay, harm-stratified sampling, a generalist keep-alive mix, and per-turn reasoning guardrails"
 tags = ["multi-turn", "refusals", "train", "eval"]
 requires-python = ">=3.10"

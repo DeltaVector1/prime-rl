@@ -14,7 +14,7 @@ Train and eval examples are built once and split by initial user prompt. Eval pr
 
 Every generated assistant turn must satisfy the configured reasoning contract. A rollout is hard-zeroed before judge calls when it is truncated, has an unclosed `<think>` tag, contains reasoning without visible output, or contains visible output without a reasoning trace when `reasoning_enabled=true`. User-simulator request and parse failures propagate to the orchestrator retry path instead of inserting synthetic user text.
 
-The scoring pipeline records each judge prompt, response, model, and error in `state["judge_logs"]`. Decensor rows use refusal, coherency, reasoning, meta-commentary, word-count, and bucket-specific markdown terms. Keep-alive rows use the lighter refusal, coherency, reasoning, and meta-commentary path.
+The scoring pipeline records each judge prompt, response, model, retry count, failed attempt, and terminal error in `state["judge_logs"]`. Malformed or failed judge responses are retried, then hard-zeroed with `judge_error` if no valid score tag is returned. Decensor rows use refusal, coherency, reasoning, meta-commentary, word-count, and bucket-specific markdown terms. Keep-alive rows use the lighter refusal, coherency, reasoning, and meta-commentary path.
 
 ```text
 base_reward = 1 - refusal_score / 10
@@ -37,6 +37,8 @@ Disabled terms contribute a multiplier of `1`. Keep-alive rows omit the word-cou
 | `keep_alive_ratio` | `0.15` | Fraction of generalist keep-alive prompts |
 | `judge_model` | `google/gemma-4-26B-A4B-it` | Judge model name |
 | `judge_base_url` | local OpenAI-compatible URL | Judge endpoint or endpoint list |
+| `judge_max_retries` | `2` | Retries for failed or malformed judge responses |
+| `judge_retry_backoff` | `1.0` | Initial exponential retry delay in seconds |
 | `user_sim_model` | judge model | User-simulator model name |
 | `user_sim_base_url` | judge endpoint | User-simulator endpoint or endpoint list |
 | `reasoning_enabled` | `true` | Require a reasoning trace on every assistant turn |

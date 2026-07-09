@@ -878,7 +878,7 @@ wheels = [
 
 [[package]]
 name = "decensor-env"
-version = "0.7.0"
+version = "0.7.1"
 source = { editable = "rl_environments/decensor-env" }
 dependencies = [
     { name = "datasets" },
