@@ -1,8 +1,8 @@
 [project]
 name = "nemotron-tool-calling"
 description = "Tool-calling env for Nemotron pivot action datasets with explicit proxy selectors for full tool-session data"
-tags = ["multi-turn", "tool-use", "agentic", "function-calling", "prompt-injection", "swe", "train", "eval", "nemotron"]
-version = "0.4.0"
+tags = ["single-turn", "tool-use", "agentic", "function-calling", "prompt-injection", "swe", "train", "eval", "nemotron"]
+version = "0.5.0"
 requires-python = ">=3.10"
 dependencies = [
     "verifiers>=0.1.12",

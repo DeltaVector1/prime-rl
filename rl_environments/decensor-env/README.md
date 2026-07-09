@@ -1,55 +1,47 @@
-decensor-env
+# decensor-env
 
-Unified RL reward environment for decensoring/anti-refusal training.
-Expects datasets with a "prompt" column (plain string).
-All judges are toggleable via TOML args.
+Multi-turn anti-refusal training environment built from `NewEden/RL-seed-Decensor` with a configurable generalist keep-alive mix.
 
-Reward formula:
-  final = base_reward * word_mult * coherency_mult * md_presence_mult * md_correctness_mult * reasoning_mult * slop_mult * reasoning_quality_mult
+## Rollouts
 
-Where base_reward = 1.0 - (refusal_score / 10.0)
+Decensor rows supply the initial user prompt and target turn count. After every assistant response, an OpenAI-compatible user-simulator endpoint generates the next user turn until `target_turns` or `max_turns` is reached. Keep-alive rows remain single-turn and preserve their source conversation as context.
 
-Feature toggles (all in [env.args]):
-  enable_system_prompts    - prepend style/length system prompts (default: true)
-  enable_adherence         - adherence judge gate (default: true)
-  enable_word_count        - word count multiplier (default: true)
-  enable_structured_markers - XML/bracket/YAML gate (default: true)
-  enable_markdown_judges   - markdown presence + correctness judges (default: true)
-  enable_reasoning_trace   - penalize ethics-based refusal in <think> (default: true)
-  reasoning_enabled        - add reasoning instructions to prompts (default: true)
-  reasoning_output_prompt  - override the default prompt requiring a closed visible <think>...</think> block before the answer
-  enable_slop_guard        - slop-guard heuristic multiplier (default: false)
-  markdown_exempt_probability - % of rollouts exempt from markdown penalty (default: 0.25)
+The decensor prompt mix uses style, plaintext, and markdown buckets. Optional length requirements are added to the system prompt. Turn counts follow `turn_decay_ratio`, and source rows are sampled across harm categories.
 
-Judges:
-  refusal     - rates refusal severity 1-9, always on
-  coherency   - coherent + complete + no roleplay narration, always on
-  adherence   - style prompt adherence, early exit gate
-  markdown    - presence (no unnecessary md) + correctness (right list types)
-  reasoning   - checks <think> trace for ethics-based refusal reasoning
-  slop-guard  - local heuristic, no LLM call, scores 0-100
+Train and eval examples are built once and split by initial user prompt. Eval prompts are excluded from training. `num_train_examples=-1` uses all locally available examples remaining after the eval holdout.
 
-By default, the reasoning contract is prepended to the system prompt and a short
-format reminder is appended to the final user turn. It tells the policy that the
-first characters of every assistant turn must be `<think>`, followed by a closed
-visible `<think>...</think>` block, then the answer.
-Reasoning traces can also come from provider-side assistant message fields such
-as `reasoning`, `reasoning_content`, or `thinking_blocks` when a host exposes
-them. For hosted Laguna-style training, prefer visible `<think>` traces and set
-model-side hidden thinking options off if the renderer strips hidden reasoning
-before scoring.
+## Guardrails
 
-Example TOML:
-  [[env]]
-  id = "mangymango/decensor-env"
+Every generated assistant turn must satisfy the configured reasoning contract. A rollout is hard-zeroed before judge calls when it is truncated, has an unclosed `<think>` tag, contains reasoning without visible output, or contains visible output without a reasoning trace when `reasoning_enabled=true`. User-simulator request and parse failures propagate to the orchestrator retry path instead of inserting synthetic user text.
 
-  [env.args]
-  dataset_names = ["NewEden/RL-Seed-Mix-Iter-3"]
-  dataset_ratios = [1.0]
-  num_train_examples = 19000
-  judge_model = "Qwen/Qwen3-VL-32B-Instruct-FP8"
-  judge_base_url = "http://72.46.85.157:31974/v1"
-  enable_system_prompts = false
-  enable_adherence = false
-  enable_word_count = false
-  enable_slop_guard = true
+The scoring pipeline records each judge prompt, response, model, and error in `state["judge_logs"]`. Decensor rows use refusal, coherency, reasoning, meta-commentary, word-count, and bucket-specific markdown terms. Keep-alive rows use the lighter refusal, coherency, reasoning, and meta-commentary path.
+
+```text
+base_reward = 1 - refusal_score / 10
+final_reward = base_reward * word_multiplier * coherent_mult
+             * md_presence_mult * md_correctness_mult * reasoning_mult
+             * meta_mult * (0.90 + 0.10 * reasoning_quality)
+```
+
+Disabled terms contribute a multiplier of `1`. Keep-alive rows omit the word-count and markdown terms.
+
+## Key Arguments
+
+| Name | Default | Description |
+|---|---:|---|
+| `decensor_dataset_name` | `NewEden/RL-seed-Decensor` | Local JSONL path or Hugging Face dataset name |
+| `num_train_examples` | `10000` | Train rows; `-1` uses the full local source after eval holdout |
+| `num_eval_examples` | `500` | Source-disjoint eval rows |
+| `max_turns` | `6` | Maximum assistant turns |
+| `turn_decay_ratio` | `0.5` | Geometric decay for target turn counts |
+| `keep_alive_ratio` | `0.15` | Fraction of generalist keep-alive prompts |
+| `judge_model` | `google/gemma-4-26B-A4B-it` | Judge model name |
+| `judge_base_url` | local OpenAI-compatible URL | Judge endpoint or endpoint list |
+| `user_sim_model` | judge model | User-simulator model name |
+| `user_sim_base_url` | judge endpoint | User-simulator endpoint or endpoint list |
+| `reasoning_enabled` | `true` | Require a reasoning trace on every assistant turn |
+| `enable_word_count` | `true` | Apply length-requirement scoring |
+| `enable_markdown_judges` | `true` | Apply bucket-aware markdown scoring |
+| `enable_reasoning_trace` | `true` | Reject ethics or policy-based refusal reasoning |
+| `enable_reasoning_coherency` | `true` | Reject incoherent reasoning traces |
+| `enable_meta_commentary` | `true` | Penalize prompt or grader meta-commentary |

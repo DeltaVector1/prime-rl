@@ -1,7 +1,7 @@
 [project]
 name = "decensor-env"
-version = "0.6.5"
-description = "Decensor env: joint multi-turn rollout with dataset-replayed user turns, 3-bucket prompt mix (styles / plaintext / markdown), geometric turn-count decay, harm-type stratified sampling, keep-alive generalist mixin, meta-commentary judge, reasoning-coherency judge, and unclosed-think-tag gate applied per turn"
+version = "0.7.0"
+description = "Decensor env with user-simulated multi-turn rollouts, prompt-style buckets, geometric turn-count decay, harm-stratified sampling, a generalist keep-alive mix, and per-turn reasoning guardrails"
 tags = ["multi-turn", "refusals", "train", "eval"]
 requires-python = ">=3.10"
 dependencies = [
@@ -17,7 +17,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-include = ["decensor_env.py", "pyproject.toml"]
+include = ["decensor_env.py", "pyproject.toml", "README.md"]
 
 [tool.verifiers.eval]
 num_examples = 50

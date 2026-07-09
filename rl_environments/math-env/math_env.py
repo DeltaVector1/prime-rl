@@ -325,6 +325,18 @@ def _count_words(text: str) -> int:
     return len([part for part in re.split(r"\s+", (text or "").strip()) if part])
 
 
+def _rollout_is_truncated(state: vf.State) -> bool:
+    if state.get("is_truncated"):
+        return True
+    for step in state.get("trajectory") or []:
+        if isinstance(step, dict):
+            if step.get("is_truncated"):
+                return True
+        elif getattr(step, "is_truncated", False):
+            return True
+    return False
+
+
 class MathZeroGuardRubric(vf.Rubric):
     """Hard-zero malformed reasoning/output shapes before math scoring."""
 
@@ -350,7 +362,7 @@ class MathZeroGuardRubric(vf.Rubric):
     def has_advantages(self) -> bool:
         return self.base_rubric.has_advantages
 
-    def _guard_breakdown(self, completion: Any) -> dict[str, Any]:
+    def _guard_breakdown(self, completion: Any, *, is_truncated: bool = False) -> dict[str, Any]:
         assistant_messages = _assistant_messages(completion)
         visible_texts = [_strip_think_tags(_message_content(message)) for message in assistant_messages]
         reasoning_traces = [
@@ -363,21 +375,25 @@ class MathZeroGuardRubric(vf.Rubric):
         )
         zero_visible_output = visible_words == 0
         unclosed_think = any(_has_unclosed_think(_message_content(message)) for message in assistant_messages)
-        multiplier = 0.0 if (unclosed_think or zero_visible_output or missing_reasoning) else 1.0
+        multiplier = 0.0 if (is_truncated or unclosed_think or zero_visible_output or missing_reasoning) else 1.0
         return {
             "math_zero_guard_multiplier": multiplier,
+            "math_zero_guard_truncated": float(is_truncated),
             "math_zero_guard_unclosed_think": float(unclosed_think),
             "math_zero_guard_zero_visible_output": float(zero_visible_output),
             "math_zero_guard_missing_reasoning": float(missing_reasoning),
             "math_zero_guard_reasoning_traces": float(len(reasoning_traces)),
             "math_zero_guard_visible_words": float(visible_words),
             "final_reward_formula": (
-                "0 if unclosed_think or zero_visible_output or missing_reasoning else base_math_reward"
+                "0 if truncated or unclosed_think or zero_visible_output or missing_reasoning else base_math_reward"
             ),
         }
 
     async def score_rollout(self, state: vf.State):
-        breakdown = self._guard_breakdown(state.get("completion"))
+        breakdown = self._guard_breakdown(
+            state.get("completion"),
+            is_truncated=_rollout_is_truncated(state),
+        )
         state.setdefault("reward_breakdown", {})["math_zero_guard"] = breakdown
         numeric_metrics = {key: value for key, value in breakdown.items() if isinstance(value, int | float)}
         if breakdown["math_zero_guard_multiplier"] == 0.0:
@@ -512,6 +528,7 @@ def load_environment(
     else:
         env = ZeroOnEmptyModelResponseSingleTurnEnv(
             dataset=build_dataset,
+            parser=rubric.parser,
             rubric=rubric,
             system_prompt=system_prompt,
         )

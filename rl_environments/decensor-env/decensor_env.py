@@ -84,9 +84,34 @@ WORD_REQUIREMENTS: tuple[tuple[str, int, int, int], ...] = (
 )
 WORD_RE = re.compile(r"[A-Za-z0-9_']+")
 STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
-    "i", "if", "in", "is", "it", "its", "of", "on", "or", "that", "the", "this",
-    "to", "with", "will", "would",
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "with",
+    "will",
+    "would",
 }
 
 # --- Judge prompts ---
@@ -323,8 +348,14 @@ USER_SIM_ANGLES: dict[str, str] = {
 
 # Angles that always apply regardless of the last assistant turn.
 _UNIVERSAL_ANGLES: tuple[str, ...] = (
-    "ADD_CONSTRAINT", "ROLEPLAY_PERSONA", "SHIFT_ANGLE", "EMOTIONAL_TONE",
-    "HYPOTHETICAL", "PERSONAL_STAKES", "METHODOLOGY", "COMPARATIVE",
+    "ADD_CONSTRAINT",
+    "ROLEPLAY_PERSONA",
+    "SHIFT_ANGLE",
+    "EMOTIONAL_TONE",
+    "HYPOTHETICAL",
+    "PERSONAL_STAKES",
+    "METHODOLOGY",
+    "COMPARATIVE",
 )
 
 _HEDGE_MARKERS = re.compile(
@@ -402,6 +433,7 @@ Output format (strict):
 
 
 # --- Helpers ---
+
 
 def strip_think_tags(text: str) -> str:
     """Remove reasoning content across all three think-tag variants:
@@ -540,6 +572,18 @@ def extract_all_assistant_messages(completion: Messages) -> list[Any]:
     if not isinstance(completion, list):
         return []
     return [m for m in completion if message_role(m) == "assistant"]
+
+
+def rollout_is_truncated(state: State) -> bool:
+    if state.get("is_truncated"):
+        return True
+    for step in state.get("trajectory") or []:
+        if isinstance(step, dict):
+            if step.get("is_truncated"):
+                return True
+        elif getattr(step, "is_truncated", False):
+            return True
+    return False
 
 
 def assistant_turn_early_termination(message: Any, *, reasoning_required: bool) -> str | None:
@@ -715,14 +759,14 @@ def prompt_text(prompt: Messages) -> str:
     if isinstance(prompt, str):
         return prompt
     return "\n".join(
-        str(m.get("content") or "")
-        for m in prompt
-        if str(m.get("role", "")).lower() in {"system", "user"}
+        str(m.get("content") or "") for m in prompt if str(m.get("role", "")).lower() in {"system", "user"}
     )
 
 
 def reasoning_trace_quality(prompt: Messages, completion: Messages) -> tuple[float, int]:
-    traces = [trace for turn in extract_all_assistant_messages(completion) if (trace := extract_message_reasoning_trace(turn))]
+    traces = [
+        trace for turn in extract_all_assistant_messages(completion) if (trace := extract_message_reasoning_trace(turn))
+    ]
     text = "\n".join(trace.strip() for trace in traces if trace.strip())
     tokens = word_tokens(text)
     word_count = len(tokens)
@@ -744,20 +788,20 @@ def reasoning_trace_quality(prompt: Messages, completion: Messages) -> tuple[flo
         overlap_score = 0.5
 
     structure_score = 1.0 if re.search(r"[.!?]\s|[\n;:]", text) else 0.4
-    quality = (
-        0.40 * length_score
-        + 0.25 * repetition_score
-        + 0.25 * overlap_score
-        + 0.10 * structure_score
-    )
+    quality = 0.40 * length_score + 0.25 * repetition_score + 0.25 * overlap_score + 0.10 * structure_score
     return clamp01(quality), word_count
 
 
 def calculate_word_count_multiplier(
-    word_count: int, requirement: str, tolerance_percent: float,
+    word_count: int,
+    requirement: str,
+    tolerance_percent: float,
 ) -> tuple[float, dict[str, Any]]:
-    bounds = {"Be verbose": (2000, 1900, 2100), "Respond tersely": (163, 75, 250),
-              "Respond in a medium-length response": (300, 200, 400)}
+    bounds = {
+        "Be verbose": (2000, 1900, 2100),
+        "Respond tersely": (163, 75, 250),
+        "Respond in a medium-length response": (300, 200, 400),
+    }
     target, minimum, maximum = bounds.get(requirement, (300, 200, 400))
     tolerance = max(1, int(target * tolerance_percent))
 
@@ -800,6 +844,7 @@ def _parse_bool(val: Any) -> bool:
 
 # --- Multi-turn helpers ---
 
+
 def _sample_turn_counts(total: int, decay: float, max_turns: int, seed: int) -> list[int]:
     """Allocate counts across K=1..max_turns following a geometric decay.
 
@@ -833,7 +878,8 @@ def _sample_turn_counts(total: int, decay: float, max_turns: int, seed: int) -> 
 
 
 def _convert_sharegpt_messages(
-    convo: list[dict], strip_system: bool = False,
+    convo: list[dict],
+    strip_system: bool = False,
 ) -> list[dict[str, str]]:
     """Convert ShareGPT-style [{from, value}, ...] to OpenAI [{role, content}, ...]."""
     out: list[dict[str, str]] = []
@@ -880,7 +926,9 @@ def _truncate_to_k_user_turns(messages: list[dict[str, str]], k: int) -> list[di
 
 
 def _stratified_sample_by_key(
-    rows_by_key: dict[str, list[Any]], target: int, seed: int,
+    rows_by_key: dict[str, list[Any]],
+    target: int,
+    seed: int,
 ) -> list[Any]:
     """Even-split sampling across keys; wraps-with-replacement when a stratum is too small."""
     rng = random.Random(seed)
@@ -907,6 +955,7 @@ def _stratified_sample_by_key(
 
 
 # --- Dataset loading ---
+
 
 def load_bucket_prompts() -> dict[str, list[str]]:
     """Load the three system-prompt pools: styles, plaintext, markdown."""
@@ -961,7 +1010,11 @@ def load_bucket_prompts() -> dict[str, list[str]]:
 
 
 def _assign_buckets(
-    n: int, styles_r: float, plaintext_r: float, markdown_r: float, seed: int,
+    n: int,
+    styles_r: float,
+    plaintext_r: float,
+    markdown_r: float,
+    seed: int,
 ) -> list[str]:
     total = styles_r + plaintext_r + markdown_r
     if total <= 0:
@@ -979,9 +1032,7 @@ def _assign_buckets(
             n_plaintext += n_markdown
         n_markdown = 0
 
-    assignments = (
-        ["styles"] * n_styles + ["plaintext"] * n_plaintext + ["markdown"] * n_markdown
-    )
+    assignments = ["styles"] * n_styles + ["plaintext"] * n_plaintext + ["markdown"] * n_markdown
     rng = random.Random(seed)
     rng.shuffle(assignments)
     return assignments
@@ -989,8 +1040,12 @@ def _assign_buckets(
 
 # --- Multi-turn dataset builder ---
 
+
 def _build_keep_alive_pool(
-    dataset_names: list[str], weights: list[float], target: int, seed: int,
+    dataset_names: list[str],
+    weights: list[float],
+    target: int,
+    seed: int,
 ) -> list[list[dict[str, str]]]:
     """Load generalist ShareGPT datasets and return pre-converted message lists.
 
@@ -1053,9 +1108,7 @@ def _decensor_candidate_paths(ds_name: str) -> list[str]:
 
     if ds_name == "NewEden/RL-seed-Decensor":
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        candidate_paths.append(
-            os.path.join(repo_root, "data", "NewEden-RL-seed-Decensor", "rl.jsonl")
-        )
+        candidate_paths.append(os.path.join(repo_root, "data", "NewEden-RL-seed-Decensor", "rl.jsonl"))
     return candidate_paths
 
 
@@ -1093,7 +1146,11 @@ def _iter_decensor_rows(ds_name: str):
 
 
 def _build_decensor_pool(
-    ds_name: str, target: int, decay: float, max_turns: int, seed: int,
+    ds_name: str,
+    target: int,
+    decay: float,
+    max_turns: int,
+    seed: int,
 ) -> list[tuple[list[dict[str, str]], int]]:
     """Load NewEden/RL-seed-Decensor, assemble K-turn prompts under geometric decay.
 
@@ -1113,14 +1170,11 @@ def _build_decensor_pool(
     rows_by_asst_turns: dict[int, dict[str, list[int]]] = {}
     for row in ds_stream:
         conv = row.get("conversations") or []
-        n_asst = sum(
-            1 for m in conv if isinstance(m, dict) and str(m.get("from", "")).lower() in ("gpt", "assistant")
-        )
+        n_asst = sum(1 for m in conv if isinstance(m, dict) and str(m.get("from", "")).lower() in ("gpt", "assistant"))
         harms = row.get("harm_types") or [row.get("harm_label") or "unknown"]
         primary = str(harms[0]) if harms else "unknown"
         idx = len(all_rows)
-        all_rows.append({"conversations": conv, "harm_types": harms,
-                         "dataset_source": row.get("dataset_source", "")})
+        all_rows.append({"conversations": conv, "harm_types": harms, "dataset_source": row.get("dataset_source", "")})
         rows_by_asst_turns.setdefault(n_asst, {}).setdefault(primary, []).append(idx)
 
     turn_counts = _sample_turn_counts(target, decay, max_turns, seed)
@@ -1165,6 +1219,16 @@ def _build_decensor_pool(
     return out[:target]
 
 
+def _resolve_num_examples(decensor_dataset_name: str, num_examples: int, keep_alive_ratio: float) -> int:
+    if num_examples >= 0:
+        return num_examples
+    decensor_count = _count_local_decensor_rows(decensor_dataset_name)
+    if decensor_count is None:
+        raise ValueError("num_examples=-1 requires a local decensor JSONL cache so the row count is known")
+    keep_alive_ratio_for_count = min(max(keep_alive_ratio, 0.0), 0.95)
+    return round(decensor_count / max(1.0 - keep_alive_ratio_for_count, 1e-9))
+
+
 def build_multiturn_dataset(
     decensor_dataset_name: str,
     keep_alive_datasets: list[str],
@@ -1180,14 +1244,7 @@ def build_multiturn_dataset(
     enable_length_prompts: bool,
     output_prompt: str | None,
 ) -> Dataset:
-    if num_examples < 0:
-        decensor_count = _count_local_decensor_rows(decensor_dataset_name)
-        if decensor_count is None:
-            raise ValueError(
-                "num_examples=-1 requires a local decensor JSONL cache so the row count is known"
-            )
-        keep_alive_ratio_for_count = min(max(keep_alive_ratio, 0.0), 0.95)
-        num_examples = round(decensor_count / max(1.0 - keep_alive_ratio_for_count, 1e-9))
+    num_examples = _resolve_num_examples(decensor_dataset_name, num_examples, keep_alive_ratio)
 
     n_keep = round(num_examples * keep_alive_ratio)
     n_dec = num_examples - n_keep
@@ -1196,15 +1253,25 @@ def build_multiturn_dataset(
     rng = random.Random(seed)
 
     keep_alive_pool = _build_keep_alive_pool(
-        keep_alive_datasets, keep_alive_weights, n_keep, seed + 1,
+        keep_alive_datasets,
+        keep_alive_weights,
+        n_keep,
+        seed + 1,
     )
     decensor_pool = _build_decensor_pool(
-        decensor_dataset_name, n_dec, turn_decay_ratio, max_turns, seed + 2,
+        decensor_dataset_name,
+        n_dec,
+        turn_decay_ratio,
+        max_turns,
+        seed + 2,
     )
 
     buckets = _assign_buckets(
-        len(decensor_pool), bucket_styles_ratio, bucket_plaintext_ratio,
-        bucket_markdown_ratio, seed + 101,
+        len(decensor_pool),
+        bucket_styles_ratio,
+        bucket_plaintext_ratio,
+        bucket_markdown_ratio,
+        seed + 101,
     )
 
     final_rows: list[dict[str, Any]] = []
@@ -1236,15 +1303,17 @@ def build_multiturn_dataset(
 
         prompt_messages = [{"role": "system", "content": "\n\n".join(sys_parts)}, initial_user]
 
-        final_rows.append({
-            "prompt": prompt_messages,
-            "info": {
-                "word_requirement": requirement_name,
-                "prompt_bucket": bucket,
-                "sample_type": "decensor",
-                "target_turns": k,
-            },
-        })
+        final_rows.append(
+            {
+                "prompt": prompt_messages,
+                "info": {
+                    "word_requirement": requirement_name,
+                    "prompt_bucket": bucket,
+                    "sample_type": "decensor",
+                    "target_turns": k,
+                },
+            }
+        )
 
     # Keep-alive samples: no bucket wrapping, no length requirement.
     # Always K=1 from the model's perspective — the source-dataset assistant
@@ -1259,21 +1328,80 @@ def build_multiturn_dataset(
                 }
             else:
                 prompt_msgs = [{"role": "system", "content": output_prompt}, *prompt_msgs]
-        final_rows.append({
-            "prompt": prompt_msgs,
-            "info": {
-                "word_requirement": "",
-                "prompt_bucket": "keep_alive",
-                "sample_type": "keep_alive",
-                "target_turns": 1,
-            },
-        })
+        final_rows.append(
+            {
+                "prompt": prompt_msgs,
+                "info": {
+                    "word_requirement": "",
+                    "prompt_bucket": "keep_alive",
+                    "sample_type": "keep_alive",
+                    "target_turns": 1,
+                },
+            }
+        )
 
     rng.shuffle(final_rows)
     return Dataset.from_list(final_rows)
 
 
+def _dataset_split_group_key(row: dict[str, Any]) -> str:
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    sample_type = str(info.get("sample_type") or "unknown")
+    prompt = row.get("prompt")
+    if sample_type == "decensor" and isinstance(prompt, list):
+        for message in prompt:
+            if isinstance(message, dict) and str(message.get("role", "")).lower() == "user":
+                return f"decensor:{str(message.get('content') or '').strip()}"
+    serialized_prompt = json.dumps(prompt, ensure_ascii=False, sort_keys=True, default=str)
+    return f"{sample_type}:{serialized_prompt}"
+
+
+def _split_disjoint_dataset(
+    dataset: Dataset,
+    num_train_examples: int | None,
+    num_eval_examples: int,
+) -> tuple[Dataset, Dataset]:
+    if num_train_examples is not None and num_train_examples < 0:
+        raise ValueError("num_train_examples must be non-negative or None")
+    if num_eval_examples < 0:
+        raise ValueError("num_eval_examples must be non-negative")
+    if num_eval_examples == 0:
+        train_count = len(dataset) if num_train_examples is None else num_train_examples
+        if train_count > len(dataset):
+            raise ValueError(f"Requested {train_count} train examples, but only {len(dataset)} are available")
+        return dataset.select(range(train_count)), dataset.select([])
+
+    group_keys = [_dataset_split_group_key(row) for row in dataset]
+    held_out_groups: set[str] = set()
+    eval_indices: list[int] = []
+    for index in range(len(dataset) - 1, -1, -1):
+        group_key = group_keys[index]
+        if group_key in held_out_groups:
+            continue
+        held_out_groups.add(group_key)
+        eval_indices.append(index)
+        if len(eval_indices) == num_eval_examples:
+            break
+    if len(eval_indices) != num_eval_examples:
+        raise ValueError(
+            f"Requested {num_eval_examples} eval examples, but only "
+            f"{len(eval_indices)} distinct prompt groups are available"
+        )
+    eval_indices.reverse()
+
+    train_indices = [index for index, key in enumerate(group_keys) if key not in held_out_groups]
+    if num_train_examples is not None:
+        train_indices = train_indices[:num_train_examples]
+        if len(train_indices) != num_train_examples:
+            raise ValueError(
+                f"Requested {num_train_examples} train examples after holding out eval groups, "
+                f"but only {len(train_indices)} are available"
+            )
+    return dataset.select(train_indices), dataset.select(eval_indices)
+
+
 # --- Reward ---
+
 
 async def _decensor_reward(prompt: Messages, completion: Messages, state: State, pipeline) -> float:
     if "_decensor_reward" in state:
@@ -1390,6 +1518,10 @@ def decensor_early_unclosed_think(state: State) -> float:
     return _decensor_indicator_metric(state, "early_termination", "unclosed_think")
 
 
+def decensor_early_truncated(state: State) -> float:
+    return _decensor_indicator_metric(state, "early_termination", "truncated")
+
+
 def decensor_early_no_reasoning(state: State) -> float:
     return _decensor_indicator_metric(state, "early_termination", "no_reasoning")
 
@@ -1404,13 +1536,20 @@ def decensor_early_structured_markers(state: State) -> float:
 
 class DecensorRubric(vf.Rubric):
     def __init__(
-        self, judge_client: AsyncOpenAI, judge_model: str,
-        judge_temperature: float, judge_min_p: float, judge_timeout: float,
-        word_count_tolerance_percent: float, incoherent_penalty_multiplier: float,
+        self,
+        judge_client: AsyncOpenAI,
+        judge_model: str,
+        judge_temperature: float,
+        judge_min_p: float,
+        judge_timeout: float,
+        word_count_tolerance_percent: float,
+        incoherent_penalty_multiplier: float,
         meta_commentary_multiplier: float,
         enable_word_count: bool,
-        enable_structured_markers: bool, enable_markdown_judges: bool,
-        enable_reasoning_trace: bool, enable_reasoning_coherency: bool,
+        enable_structured_markers: bool,
+        enable_markdown_judges: bool,
+        enable_reasoning_trace: bool,
+        enable_reasoning_coherency: bool,
         enable_meta_commentary: bool,
         reasoning_enabled: bool,
         markdown_exempt_probability: float,
@@ -1455,6 +1594,7 @@ class DecensorRubric(vf.Rubric):
             decensor_bucket_plaintext,
             decensor_bucket_markdown,
             decensor_bucket_styles,
+            decensor_early_truncated,
             decensor_early_unclosed_think,
             decensor_early_no_reasoning,
             decensor_early_zero_words,
@@ -1493,7 +1633,10 @@ class DecensorRubric(vf.Rubric):
         return log
 
     async def _score_keep_alive(
-        self, prompt: Messages, completion: Messages, response_text_raw: str,
+        self,
+        prompt: Messages,
+        completion: Messages,
+        response_text_raw: str,
         breakdown: dict[str, Any],
     ) -> tuple[float, dict[str, Any]]:
         """Lightweight reward for general/forgetting-prevention prompts.
@@ -1528,8 +1671,12 @@ class DecensorRubric(vf.Rubric):
                 )
             )
 
-        results = await asyncio.gather(*(self._judge_text(job_prompt) for _, job_prompt in jobs), return_exceptions=True)
-        breakdown["judge_logs"] = [self._judge_log(name, job_prompt, raw) for (name, job_prompt), raw in zip(jobs, results)]
+        results = await asyncio.gather(
+            *(self._judge_text(job_prompt) for _, job_prompt in jobs), return_exceptions=True
+        )
+        breakdown["judge_logs"] = [
+            self._judge_log(name, job_prompt, raw) for (name, job_prompt), raw in zip(jobs, results)
+        ]
         parsed: dict[str, Any] = {}
         for (name, _job_prompt), raw in zip(jobs, results):
             parsed[name] = None if isinstance(raw, Exception) else raw
@@ -1561,34 +1708,41 @@ class DecensorRubric(vf.Rubric):
         reasoning_quality, reasoning_words = reasoning_trace_quality(prompt, completion)
         final_reward = base_reward * coherent_mult * reasoning_mult * meta_mult
         final_reward *= 0.90 + 0.10 * reasoning_quality
-        breakdown.update({
-            "final_reward": final_reward,
-            "refusal_score": refusal_score,
-            "base_reward": base_reward,
-            "coherency": coherency_score,
-            "reasoning_coherency": reasoning_coherency_score,
-            "reasoning_mult": reasoning_mult,
-            "reasoning_quality": reasoning_quality,
-            "reasoning_words": reasoning_words,
-            "meta_commentary": meta_score,
-            "meta_mult": meta_mult,
-            "final_reward_formula": (
-                "base_reward * coherent_mult * reasoning_mult * meta_mult * "
-                "(0.90 + 0.10 * reasoning_quality)"
-            ),
-        })
+        breakdown.update(
+            {
+                "final_reward": final_reward,
+                "refusal_score": refusal_score,
+                "base_reward": base_reward,
+                "coherency": coherency_score,
+                "reasoning_coherency": reasoning_coherency_score,
+                "reasoning_mult": reasoning_mult,
+                "reasoning_quality": reasoning_quality,
+                "reasoning_words": reasoning_words,
+                "meta_commentary": meta_score,
+                "meta_mult": meta_mult,
+                "final_reward_formula": (
+                    "base_reward * coherent_mult * reasoning_mult * meta_mult * (0.90 + 0.10 * reasoning_quality)"
+                ),
+            }
+        )
         return final_reward, breakdown
 
     async def _run_decensor_rollout(
-        self, prompt: Messages, completion: Messages, state: State,
+        self,
+        prompt: Messages,
+        completion: Messages,
+        state: State,
     ) -> tuple[float, dict[str, Any]]:
         response_text_raw = extract_completion_text(completion)
 
         info = state.get("info", {}) or {}
         sample_type = str(info.get("sample_type", "decensor"))
 
-        breakdown: dict[str, Any] = {"final_reward": 0.0, "early_termination": None,
-                                      "sample_type": sample_type}
+        breakdown: dict[str, Any] = {"final_reward": 0.0, "early_termination": None, "sample_type": sample_type}
+
+        if rollout_is_truncated(state):
+            breakdown["early_termination"] = "truncated"
+            return 0.0, breakdown
 
         # Hard local gate: check every model-generated turn, not just the final one.
         # Malformed reasoning/output shape in any turn invalidates the rollout.
@@ -1621,7 +1775,8 @@ class DecensorRubric(vf.Rubric):
         breakdown["word_count"] = word_count
         if self.enable_word_count and word_requirement:
             word_multiplier, _ = calculate_word_count_multiplier(
-                word_count, word_requirement, self.word_count_tolerance_percent)
+                word_count, word_requirement, self.word_count_tolerance_percent
+            )
         else:
             word_multiplier = 1.0
 
@@ -1668,8 +1823,12 @@ class DecensorRubric(vf.Rubric):
             if bucket in ("styles", "markdown"):
                 jobs.append(("md_correctness", MARKDOWN_CORRECTNESS_JUDGE_PROMPT.format(response=response_text)))
 
-        results = await asyncio.gather(*(self._judge_text(job_prompt) for _, job_prompt in jobs), return_exceptions=True)
-        breakdown["judge_logs"] = [self._judge_log(name, job_prompt, raw) for (name, job_prompt), raw in zip(jobs, results)]
+        results = await asyncio.gather(
+            *(self._judge_text(job_prompt) for _, job_prompt in jobs), return_exceptions=True
+        )
+        breakdown["judge_logs"] = [
+            self._judge_log(name, job_prompt, raw) for (name, job_prompt), raw in zip(jobs, results)
+        ]
         parsed: dict[str, Any] = {}
         for (name, _job_prompt), raw in zip(jobs, results):
             if isinstance(raw, Exception):
@@ -1744,39 +1903,40 @@ class DecensorRubric(vf.Rubric):
 
         reasoning_quality, reasoning_words = reasoning_trace_quality(prompt, completion)
         final_reward = (
-            base_reward * word_multiplier * coherent_mult
-            * md_pres_mult * md_corr_mult * reasoning_mult
-            * meta_mult
+            base_reward * word_multiplier * coherent_mult * md_pres_mult * md_corr_mult * reasoning_mult * meta_mult
         )
         final_reward *= 0.90 + 0.10 * reasoning_quality
 
-        breakdown.update({
-            "final_reward": final_reward,
-            "refusal_score": refusal_score,
-            "base_reward": base_reward,
-            "word_multiplier": word_multiplier,
-            "coherency": coherency_score,
-            "md_presence": md_pres_score,
-            "md_correctness": md_corr_score,
-            "md_presence_mult": md_pres_mult,
-            "md_correctness_mult": md_corr_mult,
-            "reasoning_ethics": reasoning_ethics_score,
-            "reasoning_coherency": reasoning_coherency_score,
-            "reasoning_mult": reasoning_mult,
-            "reasoning_quality": reasoning_quality,
-            "reasoning_words": reasoning_words,
-            "meta_commentary": meta_score,
-            "meta_mult": meta_mult,
-            "final_reward_formula": (
-                "base_reward * word_multiplier * coherent_mult * "
-                "md_presence_mult * md_correctness_mult * reasoning_mult * "
-                "meta_mult * (0.90 + 0.10 * reasoning_quality)"
-            ),
-        })
+        breakdown.update(
+            {
+                "final_reward": final_reward,
+                "refusal_score": refusal_score,
+                "base_reward": base_reward,
+                "word_multiplier": word_multiplier,
+                "coherency": coherency_score,
+                "md_presence": md_pres_score,
+                "md_correctness": md_corr_score,
+                "md_presence_mult": md_pres_mult,
+                "md_correctness_mult": md_corr_mult,
+                "reasoning_ethics": reasoning_ethics_score,
+                "reasoning_coherency": reasoning_coherency_score,
+                "reasoning_mult": reasoning_mult,
+                "reasoning_quality": reasoning_quality,
+                "reasoning_words": reasoning_words,
+                "meta_commentary": meta_score,
+                "meta_mult": meta_mult,
+                "final_reward_formula": (
+                    "base_reward * word_multiplier * coherent_mult * "
+                    "md_presence_mult * md_correctness_mult * reasoning_mult * "
+                    "meta_mult * (0.90 + 0.10 * reasoning_quality)"
+                ),
+            }
+        )
         return final_reward, breakdown
 
 
 # --- Multi-turn env ---
+
 
 def _is_empty_model_response_error(error: Any) -> bool:
     return isinstance(error, vf.EmptyModelResponseError)
@@ -1932,28 +2092,23 @@ class DecensorMultiTurnEnv(ZeroOnEmptyModelResponseMixin, vf.MultiTurnEnv):
         angle_key = _pick_angle(last_asst, random)
         angle = USER_SIM_ANGLES[angle_key]
         prompt_text = USER_SIM_PROMPT.format(angle=angle, conversation=conv_text)
-        try:
-            response = await asyncio.wait_for(
-                self.user_sim_client.chat.completions.create(
-                    model=self.user_sim_model,
-                    messages=[{"role": "user", "content": prompt_text}],
-                    temperature=self.user_sim_temperature,
-                    max_tokens=self.user_sim_max_tokens,
-                    extra_body={
-                        **({"min_p": self.user_sim_min_p} if self.user_sim_min_p else {}),
-                        "chat_template_kwargs": {"enable_thinking": False},
-                    },
-                ),
-                timeout=self.user_sim_timeout,
-            )
-            raw = str(response.choices[0].message.content or "")
-        except Exception:
-            raw = ""
+        response = await asyncio.wait_for(
+            self.user_sim_client.chat.completions.create(
+                model=self.user_sim_model,
+                messages=[{"role": "user", "content": prompt_text}],
+                temperature=self.user_sim_temperature,
+                max_tokens=self.user_sim_max_tokens,
+                extra_body={
+                    **({"min_p": self.user_sim_min_p} if self.user_sim_min_p else {}),
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            ),
+            timeout=self.user_sim_timeout,
+        )
+        raw = str(response.choices[0].message.content or "")
         text = _parse_user_turn_output(raw)
         if not text:
-            # Defensive fallback so the rollout doesn't emit an empty user turn;
-            # the rubric's final-turn judges won't see this unless it's the last.
-            text = "Continue with more specific detail."
+            raise ValueError("User simulator returned no parseable user turn")
         return [{"role": "user", "content": text}]
 
     @vf.stop
@@ -1966,6 +2121,9 @@ class DecensorMultiTurnEnv(ZeroOnEmptyModelResponseMixin, vf.MultiTurnEnv):
         traj = state.get("trajectory", [])
         if not traj:
             return False
+        if rollout_is_truncated(state):
+            state["decensor_early_termination"] = "truncated"
+            return True
         comp = traj[-1].get("completion")
         for turn in extract_all_assistant_messages(comp):
             early = assistant_turn_early_termination(turn, reasoning_required=self.reasoning_enabled)
@@ -1976,6 +2134,7 @@ class DecensorMultiTurnEnv(ZeroOnEmptyModelResponseMixin, vf.MultiTurnEnv):
 
 
 # --- Entry point ---
+
 
 def load_environment(
     num_train_examples: int = 10000,
@@ -2082,13 +2241,22 @@ def load_environment(
     hf_token = os.environ.get("HF_TOKEN")
     if hf_token:
         from huggingface_hub import login
+
         login(token=hf_token, add_to_git_credential=False)
 
-    train_dataset = build_multiturn_dataset(
+    if num_train_examples < -1:
+        raise ValueError("num_train_examples must be -1 or non-negative")
+    if num_eval_examples < 0:
+        raise ValueError("num_eval_examples must be non-negative")
+
+    resolved_train_examples = _resolve_num_examples(decensor_dataset_name, num_train_examples, keep_alive_ratio)
+    train_target = None if num_train_examples == -1 else resolved_train_examples
+    split_buffer = 0 if train_target is None else max(num_eval_examples * 4, num_eval_examples)
+    combined_dataset = build_multiturn_dataset(
         decensor_dataset_name=decensor_dataset_name,
         keep_alive_datasets=keep_alive_datasets,
         keep_alive_weights=keep_alive_weights,
-        num_examples=num_train_examples,
+        num_examples=resolved_train_examples + split_buffer,
         seed=dataset_seed,
         keep_alive_ratio=keep_alive_ratio,
         turn_decay_ratio=turn_decay_ratio,
@@ -2099,20 +2267,10 @@ def load_environment(
         enable_length_prompts=enable_length_prompts,
         output_prompt=reasoning_output_prompt if reasoning_enabled else None,
     )
-    eval_dataset = build_multiturn_dataset(
-        decensor_dataset_name=decensor_dataset_name,
-        keep_alive_datasets=keep_alive_datasets,
-        keep_alive_weights=keep_alive_weights,
-        num_examples=num_eval_examples,
-        seed=dataset_seed + 1,
-        keep_alive_ratio=keep_alive_ratio,
-        turn_decay_ratio=turn_decay_ratio,
-        max_turns=max_turns,
-        bucket_styles_ratio=bucket_styles_ratio,
-        bucket_plaintext_ratio=bucket_plaintext_ratio,
-        bucket_markdown_ratio=bucket_markdown_ratio,
-        enable_length_prompts=enable_length_prompts,
-        output_prompt=reasoning_output_prompt if reasoning_enabled else None,
+    train_dataset, eval_dataset = _split_disjoint_dataset(
+        combined_dataset,
+        num_train_examples=train_target,
+        num_eval_examples=num_eval_examples,
     )
 
     if judge_api_key is None:
@@ -2131,12 +2289,16 @@ def load_environment(
         timeout=user_sim_timeout,
     )
     user_sim_client = _openai_client(
-        base_url=user_sim_base_url, api_key=user_sim_api_key, http_client=user_sim_http_client,
+        base_url=user_sim_base_url,
+        api_key=user_sim_api_key,
+        http_client=user_sim_http_client,
     )
 
     rubric = DecensorRubric(
-        judge_client=client, judge_model=judge_model,
-        judge_temperature=judge_temperature, judge_min_p=judge_min_p,
+        judge_client=client,
+        judge_model=judge_model,
+        judge_temperature=judge_temperature,
+        judge_min_p=judge_min_p,
         judge_timeout=judge_timeout,
         word_count_tolerance_percent=word_count_tolerance_percent,
         incoherent_penalty_multiplier=incoherent_penalty_multiplier,
@@ -2152,8 +2314,10 @@ def load_environment(
     )
 
     return DecensorMultiTurnEnv(
-        dataset=train_dataset, eval_dataset=eval_dataset,
-        rubric=rubric, parser=vf.Parser(extract_fn=strip_think_tags),
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        rubric=rubric,
+        parser=vf.Parser(extract_fn=strip_think_tags),
         max_turns=max_turns + 2,  # safety cap above per-sample target
         user_sim_client=user_sim_client,
         user_sim_model=user_sim_model,

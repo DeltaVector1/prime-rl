@@ -90,9 +90,34 @@ STRUCTURED_MARKER_RE = re.compile(
 )
 WORD_RE = re.compile(r"[A-Za-z0-9_']+")
 STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
-    "i", "if", "in", "is", "it", "its", "of", "on", "or", "that", "the", "this",
-    "to", "with", "will", "would",
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "with",
+    "will",
+    "would",
 }
 
 
@@ -246,12 +271,7 @@ def reasoning_trace_quality(prompt: Any, traces: list[str]) -> tuple[float, int]
         overlap_score = 0.5
 
     structure_score = 1.0 if re.search(r"[.!?]\s|[\n;:]", text) else 0.4
-    quality = (
-        0.40 * length_score
-        + 0.25 * repetition_score
-        + 0.25 * overlap_score
-        + 0.10 * structure_score
-    )
+    quality = 0.40 * length_score + 0.25 * repetition_score + 0.25 * overlap_score + 0.10 * structure_score
     return clamp01(quality), word_count
 
 
@@ -544,6 +564,18 @@ def serialize_raw_completion(completion: Any) -> Any:
     return sanitize_tool_calls(serialize_messages_for_output(completion))
 
 
+def rollout_is_truncated(state: vf.State) -> bool:
+    if state.get("is_truncated"):
+        return True
+    for step in state.get("trajectory") or []:
+        if isinstance(step, dict):
+            if step.get("is_truncated"):
+                return True
+        elif getattr(step, "is_truncated", False):
+            return True
+    return False
+
+
 class GuardedRubric(vf.Rubric):
     def __init__(self, base_rubric: vf.Rubric, config: AntiHackingConfig):
         super().__init__(parser=vf.Parser(extract_fn=strip_think_tags))
@@ -570,14 +602,15 @@ class GuardedRubric(vf.Rubric):
             format_reward = 0.78 * tool_shape + 0.22 * reasoning_quality
             metrics["anti_hacking_format_reward"] = format_reward
         weight = clamp01(self.config.format_reward_weight)
-        final_reward = multiplier * ((1.0 - weight) * base_reward + weight * format_reward)
+        format_multiplier = (1.0 - weight) + weight * format_reward
+        final_reward = multiplier * base_reward * format_multiplier
         metrics["anti_hacking_format_reward"] = format_reward
         metrics["anti_hacking_format_reward_weight"] = weight
         metrics["final_reward"] = final_reward
         breakdown = dict(metrics)
         breakdown["final_reward_formula"] = (
-            "anti_hacking_multiplier * "
-            "((1 - anti_hacking_format_reward_weight) * task_reward + "
+            "anti_hacking_multiplier * task_reward * "
+            "((1 - anti_hacking_format_reward_weight) + "
             "anti_hacking_format_reward_weight * anti_hacking_format_reward)"
         )
         state["reward"] = final_reward
@@ -601,6 +634,7 @@ class GuardedRubric(vf.Rubric):
         reasoning_quality, reasoning_words = reasoning_trace_quality(prompt, reasoning_traces)
         metrics: dict[str, Any] = {
             "anti_hacking_multiplier": 1.0,
+            "anti_hacking_truncated": 0.0,
             "anti_hacking_unclosed_think": 0.0,
             "anti_hacking_zero_visible_words": 0.0,
             "anti_hacking_missing_reasoning": 0.0,
@@ -618,6 +652,11 @@ class GuardedRubric(vf.Rubric):
             "anti_hacking_meta_commentary": -1.0,
         }
 
+        if rollout_is_truncated(state):
+            metrics["anti_hacking_truncated"] = 1.0
+            metrics["anti_hacking_multiplier"] = 0.0
+            state["anti_hacking_breakdown"] = metrics
+            return 0.0, metrics
         if any(has_unclosed_think(text) for text in assistant_texts):
             metrics["anti_hacking_unclosed_think"] = 1.0
             metrics["anti_hacking_multiplier"] = 0.0
@@ -632,10 +671,9 @@ class GuardedRubric(vf.Rubric):
         renderer_stripped_messages = [msg for msg in missing_reasoning_messages if is_renderer_stripped_tool_call(msg)]
         metrics["anti_hacking_renderer_stripped_tool_calls"] = float(len(renderer_stripped_messages))
         if config.reasoning_required and missing_reasoning_messages:
-            allow_renderer_fallback = (
-                config.allow_renderer_stripped_tool_calls
-                and len(renderer_stripped_messages) == len(missing_reasoning_messages)
-            )
+            allow_renderer_fallback = config.allow_renderer_stripped_tool_calls and len(
+                renderer_stripped_messages
+            ) == len(missing_reasoning_messages)
             if allow_renderer_fallback:
                 metrics["anti_hacking_renderer_tool_call_fallback"] = 1.0
             else:
@@ -682,9 +720,13 @@ class GuardedRubric(vf.Rubric):
                         "meta_commentary",
                         META_COMMENTARY_JUDGE_PROMPT.format(system_prompt=system_prompt, conversation=transcript),
                     )
+                )
+            results = await asyncio.gather(
+                *(_judge_text(config, job_prompt) for _, job_prompt in jobs), return_exceptions=True
             )
-            results = await asyncio.gather(*(_judge_text(config, job_prompt) for _, job_prompt in jobs), return_exceptions=True)
-            judge_logs = [_judge_log(config, name, job_prompt, result) for (name, job_prompt), result in zip(jobs, results)]
+            judge_logs = [
+                _judge_log(config, name, job_prompt, result) for (name, job_prompt), result in zip(jobs, results)
+            ]
             logs = state.setdefault("judge_logs", [])
             if isinstance(logs, list):
                 logs.extend(judge_logs)
@@ -704,7 +746,9 @@ class GuardedRubric(vf.Rubric):
                 multiplier = 0.0
 
             reasoning_coherency_score = parse_score_tag(parsed.get("reasoning_coherency"))
-            metrics["anti_hacking_reasoning_coherency"] = 1 if reasoning_coherency_score is None else reasoning_coherency_score
+            metrics["anti_hacking_reasoning_coherency"] = (
+                1 if reasoning_coherency_score is None else reasoning_coherency_score
+            )
             if reasoning_coherency_score == 0:
                 multiplier = 0.0
 

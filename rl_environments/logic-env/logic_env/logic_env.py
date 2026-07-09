@@ -137,6 +137,7 @@ def load_environment(
     dataset_subset: str = "logic",
     dataset_split: str = "train",
     dataset_shuffle: bool = False,
+    dataset_seed: int = 42,
     difficulty_key: str = "avg@16_qwen3_4b_instruct_2507",
     min_avg_reward: float = 0.0,
     max_avg_reward: float = 1.0,
@@ -154,7 +155,7 @@ def load_environment(
             .select_columns(["question", "answer", "info"])
         )
         if dataset_shuffle:
-            ds = ds.shuffle(seed=42)
+            ds = ds.shuffle(seed=dataset_seed)
         return ds
 
     def correct_answer(completion: vf.Messages, info: vf.Info, **kwargs) -> float:

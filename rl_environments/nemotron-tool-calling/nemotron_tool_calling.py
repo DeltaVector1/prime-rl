@@ -6,11 +6,10 @@ Pivot datasets score the next assistant action against ``expected_action``:
 * ``function_calling`` — function-call pivot actions
 * ``swe_pivot`` — SWE pivot actions
 
-The pivot rows are next-action tasks, but they contain OpenAI Responses-style
-transcripts with historical function calls and tool outputs. This env preserves
-that transcript as native chat tool messages and gives the policy one extra
-turn after a tool call so training examples exercise real tool-call plumbing
-instead of visible JSON code blocks.
+The pivot rows are single-step next-action tasks, but they contain OpenAI
+Responses-style transcripts with historical function calls and tool outputs.
+This env preserves that transcript as native chat tool messages and exposes the
+source schemas so the policy predicts exactly one native next action.
 """
 
 from __future__ import annotations
@@ -162,27 +161,13 @@ def _reasoning_summary_text(item: dict[str, Any]) -> str:
     return _response_content_text(summary)
 
 
-def _canonical_args(args: Any) -> str:
-    normalized = _normalize_args(args)
-    try:
-        return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    except Exception:
-        return json.dumps({"raw": str(args)}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _tool_result_key(name: str, args: Any) -> str:
-    return f"{name}\n{_canonical_args(args)}"
-
-
-def _input_to_prompt_and_tool_results(payload: Any) -> tuple[list[dict[str, Any]], dict[str, str]]:
+def _input_to_prompt(payload: Any) -> list[dict[str, Any]]:
     payload = _coerce(payload)
     items = payload.get("input") if isinstance(payload, dict) else payload
     if not isinstance(items, list):
-        return [], {}
+        return []
     msgs: list[dict[str, Any]] = []
-    tool_results: dict[str, str] = {}
     pending_reasoning = ""
-    pending_tool_calls: dict[str, tuple[str, Any]] = {}
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -214,17 +199,12 @@ def _input_to_prompt_and_tool_results(payload: Any) -> tuple[list[dict[str, Any]
                 msg["reasoning_content"] = pending_reasoning
                 pending_reasoning = ""
             msgs.append(msg)
-            pending_tool_calls[tool_call_id] = (name, arguments)
             continue
 
         if item_type == "function_call_output":
             output = _response_content_text(item.get("output"))
             call_id = str(item.get("call_id") or f"call_{len(msgs)}")
             msgs.append({"role": "tool", "tool_call_id": call_id, "content": output})
-            pending_tool_call = pending_tool_calls.pop(call_id, None)
-            if pending_tool_call is not None:
-                name, arguments = pending_tool_call
-                tool_results[_tool_result_key(name, arguments)] = output
             continue
 
         if role in {"system", "user"}:
@@ -242,12 +222,7 @@ def _input_to_prompt_and_tool_results(payload: Any) -> tuple[list[dict[str, Any]
             if content.strip() or msg.get("reasoning_content"):
                 msgs.append(msg)
 
-    return msgs, tool_results
-
-
-def _input_to_prompt(payload: Any) -> list[dict[str, Any]]:
-    prompt, _tool_results = _input_to_prompt_and_tool_results(payload)
-    return prompt
+    return msgs
 
 
 def _normalize_tool_def(raw_tool: Any) -> dict[str, Any] | None:
@@ -288,7 +263,7 @@ def _format_tool_defs_for_prompt(tool_defs: list[dict[str, Any]]) -> str:
         "Available external actions are listed below. Use these exact action names and argument fields.",
         "When an external action is needed, output only a visible JSON object or JSON array in a ```json code block:",
         "```json",
-        "{\"name\":\"action_name\",\"arguments\":{...}}",
+        '{"name":"action_name","arguments":{...}}',
         "```",
         "<available_actions>",
     ]
@@ -308,13 +283,13 @@ def _prepare_prompt(
     payload: Any,
     system_prompt: str | None,
     native_tool_calls: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
-    prompt, tool_results = _input_to_prompt_and_tool_results(payload)
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    prompt = _input_to_prompt(payload)
     tool_defs = _extract_tool_defs(payload)
     if not native_tool_calls:
         prompt = merge_system_prompt(prompt, _format_tool_defs_for_prompt(tool_defs))
     prompt = merge_system_prompt(prompt, system_prompt)
-    return prompt, tool_defs, tool_results
+    return prompt, tool_defs
 
 
 def _message_role(message: Any) -> str:
@@ -683,88 +658,28 @@ class ZeroOnEmptyModelResponseMixin:
         return group_states
 
 
-class DatasetToolCallingEnv(ZeroOnEmptyModelResponseMixin, vf.MultiTurnEnv):
+class DatasetToolCallingEnv(ZeroOnEmptyModelResponseMixin, vf.SingleTurnEnv):
     def __init__(
         self,
         *args,
         enable_native_tool_calls: bool = True,
-        max_turns: int = 2,
         **kwargs,
     ):
-        super().__init__(*args, max_turns=max_turns, **kwargs)
+        super().__init__(*args, **kwargs)
         self.enable_native_tool_calls = parse_bool(enable_native_tool_calls)
-
-    @vf.stop
-    async def no_tools_called(self, state: vf.State) -> bool:
-        if not state.get("trajectory"):
-            return False
-        completion = state["trajectory"][-1].get("completion") or []
-        if not completion:
-            return False
-        last_message = completion[-1]
-        return _message_role(last_message) == "assistant" and not _message_tool_calls(last_message)
 
     async def setup_state(self, state: vf.State) -> vf.State:
         await super().setup_state(state)
         info = state.get("info")
-        state["executed_tool_calls"] = []
-        raw_results = info.get("tool_result_map_json") if isinstance(info, dict) else None
-        try:
-            state["tool_result_map"] = json.loads(raw_results or "{}")
-        except Exception:
-            state["tool_result_map"] = {}
         if not self.enable_native_tool_calls:
             return state
         raw_tool_defs = info.get("tool_defs_json") if isinstance(info, dict) else None
         if raw_tool_defs:
-            try:
-                tool_defs = json.loads(raw_tool_defs)
-            except Exception:
-                tool_defs = []
+            tool_defs = json.loads(raw_tool_defs)
+            if not isinstance(tool_defs, list):
+                raise ValueError("info['tool_defs_json'] must decode to a list")
             state["tool_defs"] = self._normalize_tool_defs(tool_defs) or []
         return state
-
-    def _tool_result_content(self, state: vf.State, name: str, args: Any) -> str:
-        result_map = state.get("tool_result_map") or {}
-        key = _tool_result_key(name, args)
-        if isinstance(result_map, dict) and key in result_map:
-            return str(result_map[key])
-        return json.dumps(
-            {
-                "ok": True,
-                "tool_name": name,
-                "arguments": _normalize_args(args),
-                "source": "nemotron_pivot_replay",
-                "message": (
-                    "Tool call accepted. No recorded output is available for this "
-                    "pivot state, so this deterministic placeholder is returned."
-                ),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-
-    async def env_response(self, messages: vf.Messages, state: vf.State, **_kwargs) -> vf.Messages:
-        if not messages:
-            return []
-        last_message = messages[-1]
-        tool_calls = _message_tool_calls(last_message)
-        if not tool_calls:
-            return []
-
-        tool_messages: list[vf.ToolMessage] = []
-        executed = state.setdefault("executed_tool_calls", [])
-        for index, tool_call in enumerate(tool_calls):
-            name, args = _call_signature(tool_call)
-            tool_call_id = _object_get(tool_call, "id", f"call_{index}")
-            executed.append({"name": name, "arguments": args})
-            tool_messages.append(
-                vf.ToolMessage(
-                    tool_call_id=str(tool_call_id),
-                    content=self._tool_result_content(state, name, args),
-                )
-            )
-        return tool_messages
 
 
 def _normalize_args(args: Any) -> dict[str, Any]:
@@ -781,8 +696,10 @@ def _args_overlap(expected: dict[str, Any], predicted: dict[str, Any]) -> float:
         if k in predicted:
             if str(predicted[k]).strip() == str(v).strip():
                 matched += 1
-            elif str(v).strip() and str(predicted[k]).strip() and (
-                str(v).strip() in str(predicted[k]).strip() or str(predicted[k]).strip() in str(v).strip()
+            elif (
+                str(v).strip()
+                and str(predicted[k]).strip()
+                and (str(v).strip() in str(predicted[k]).strip() or str(predicted[k]).strip() in str(v).strip())
             ):
                 matched += 0.5
     return matched / max(1, len(expected))
@@ -995,6 +912,11 @@ async def ipi_resistance(completion, info, **_kwargs) -> float:
 def _load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[dict[str, Any]]:
     import random
 
+    if num_examples < -1:
+        raise ValueError("num_examples must be -1 or non-negative")
+    if num_examples == 0:
+        return []
+
     path = hf_hub_download(repo, filename, repo_type="dataset")
     rows: list[dict[str, Any]] = []
     rng = random.Random(seed)
@@ -1002,14 +924,14 @@ def _load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[
     if num_examples > 0:
         seen = 0
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_number, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
                 seen += 1
                 if len(rows) < num_examples:
                     rows.append(row)
@@ -1021,16 +943,112 @@ def _load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[
         return rows
 
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
     rng.shuffle(rows)
     return rows
+
+
+def _dataset_group_key(row: dict[str, Any]) -> str:
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    subtask = str(info.get("subtask") or "unknown")
+    identity_keys = ("instance_id", "trajectory_id", "id") if subtask == "swe_pivot" else ("trajectory_id", "id")
+    for key in identity_keys:
+        value = str(info.get(key) or "").strip()
+        if value:
+            return f"{subtask}:{key}:{value}"
+    prompt = json.dumps(row.get("prompt"), ensure_ascii=False, sort_keys=True, default=str)
+    return f"{subtask}:prompt:{prompt}"
+
+
+def _split_disjoint_dataset(
+    dataset: Dataset,
+    num_train_examples: int,
+    num_eval_examples: int,
+) -> tuple[Dataset, Dataset]:
+    if num_train_examples < -1:
+        raise ValueError("num_train_examples must be -1 or non-negative")
+    if num_eval_examples < 0:
+        raise ValueError("num_eval_examples must be non-negative")
+
+    if num_eval_examples == 0:
+        train_count = len(dataset) if num_train_examples == -1 else num_train_examples
+        if train_count > len(dataset):
+            raise ValueError(f"Requested {train_count} train examples, but only {len(dataset)} are available")
+        return dataset.select(range(train_count)), dataset.select([])
+
+    group_keys = [_dataset_group_key(row) for row in dataset]
+    held_out_groups: set[str] = set()
+    eval_indices: list[int] = []
+    for index in range(len(dataset) - 1, -1, -1):
+        group_key = group_keys[index]
+        if group_key in held_out_groups:
+            continue
+        held_out_groups.add(group_key)
+        eval_indices.append(index)
+        if len(eval_indices) == num_eval_examples:
+            break
+
+    if len(eval_indices) != num_eval_examples:
+        raise ValueError(
+            f"Requested {num_eval_examples} eval examples, but only "
+            f"{len(eval_indices)} distinct source groups are available"
+        )
+    eval_indices.reverse()
+
+    train_indices = [index for index, key in enumerate(group_keys) if key not in held_out_groups]
+    if num_train_examples >= 0:
+        train_indices = train_indices[:num_train_examples]
+        if len(train_indices) != num_train_examples:
+            raise ValueError(
+                f"Requested {num_train_examples} train examples after holding out eval groups, "
+                f"but only {len(train_indices)} are available"
+            )
+    return dataset.select(train_indices), dataset.select(eval_indices)
+
+
+def _make_disjoint_dataset_builders(
+    build_dataset,
+    num_train_examples: int,
+    num_eval_examples: int,
+):
+    cached: tuple[Dataset, Dataset] | None = None
+
+    def build_pair() -> tuple[Dataset, Dataset]:
+        nonlocal cached
+        if cached is not None:
+            return cached
+        if num_train_examples < -1:
+            raise ValueError("num_train_examples must be -1 or non-negative")
+        if num_eval_examples < 0:
+            raise ValueError("num_eval_examples must be non-negative")
+
+        load_count = (
+            -1 if num_train_examples == -1 else num_train_examples + max(num_eval_examples * 4, num_eval_examples)
+        )
+        full_dataset = build_dataset(load_count)
+        try:
+            cached = _split_disjoint_dataset(full_dataset, num_train_examples, num_eval_examples)
+        except ValueError:
+            if load_count == -1:
+                raise
+            full_dataset = build_dataset(-1)
+            cached = _split_disjoint_dataset(full_dataset, num_train_examples, num_eval_examples)
+        return cached
+
+    def build_train() -> Dataset:
+        return build_pair()[0]
+
+    def build_eval() -> Dataset:
+        return build_pair()[1]
+
+    return build_train, build_eval
 
 
 def _build_tool_use(
@@ -1045,9 +1063,7 @@ def _build_tool_use(
     raw = _load_jsonl(repo, filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
-        prompt, tool_defs, tool_results = _prepare_prompt(
-            row.get("responses_create_params"), system_prompt, native_tool_calls
-        )
+        prompt, tool_defs = _prepare_prompt(row.get("responses_create_params"), system_prompt, native_tool_calls)
         expected = _coerce(row.get("expected_action"))
         if not prompt or not isinstance(expected, dict):
             continue
@@ -1058,7 +1074,6 @@ def _build_tool_use(
                     "trajectory_id": str(row.get("trajectory_id", "")),
                     "expected_action_json": json.dumps(expected, default=str),
                     "tool_defs_json": json.dumps(tool_defs, default=str),
-                    "tool_result_map_json": json.dumps(tool_results, default=str),
                     "subtask": subtask,
                 },
             }
@@ -1076,9 +1091,7 @@ def _build_function_calling(
     raw = _load_jsonl(FUNCTION_CALLING_DATASET, filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
-        prompt, tool_defs, tool_results = _prepare_prompt(
-            row.get("responses_create_params"), system_prompt, native_tool_calls
-        )
+        prompt, tool_defs = _prepare_prompt(row.get("responses_create_params"), system_prompt, native_tool_calls)
         expected = _coerce(row.get("expected_action"))
         if not prompt or not isinstance(expected, dict):
             continue
@@ -1089,7 +1102,6 @@ def _build_function_calling(
                     "trajectory_id": str(row.get("trajectory_id", "")),
                     "expected_action_json": json.dumps(expected, default=str),
                     "tool_defs_json": json.dumps(tool_defs, default=str),
-                    "tool_result_map_json": json.dumps(tool_results, default=str),
                     "subtask": "function_calling",
                 },
             }
@@ -1107,9 +1119,7 @@ def _build_workplace(
     raw = _load_jsonl(WORKPLACE_DATASET, filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
-        prompt, tool_defs, tool_results = _prepare_prompt(
-            row.get("responses_create_params"), system_prompt, native_tool_calls
-        )
+        prompt, tool_defs = _prepare_prompt(row.get("responses_create_params"), system_prompt, native_tool_calls)
         ground = _coerce(row.get("ground_truth"))
         if not prompt or not isinstance(ground, list) or not ground:
             continue
@@ -1121,7 +1131,6 @@ def _build_workplace(
                     "category": str(row.get("category", "")),
                     "ground_truth_json": json.dumps(ground, default=str),
                     "tool_defs_json": json.dumps(tool_defs, default=str),
-                    "tool_result_map_json": json.dumps(tool_results, default=str),
                     "subtask": "workplace",
                 },
             }
@@ -1139,9 +1148,7 @@ def _build_indirect_prompt_injection(
     raw = _load_jsonl(INDIRECT_PROMPT_INJECTION_DATASET, filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
-        prompt, tool_defs, tool_results = _prepare_prompt(
-            row.get("responses_create_params"), system_prompt, native_tool_calls
-        )
+        prompt, tool_defs = _prepare_prompt(row.get("responses_create_params"), system_prompt, native_tool_calls)
         target_tool = str(row.get("target_tool", "")).strip()
         required_tools = _coerce(row.get("required_tools")) or []
         if not prompt or not target_tool:
@@ -1157,7 +1164,6 @@ def _build_indirect_prompt_injection(
                     "target_tool": target_tool,
                     "required_tools_json": json.dumps(required_tools, default=str),
                     "tool_defs_json": json.dumps(tool_defs, default=str),
-                    "tool_result_map_json": json.dumps(tool_results, default=str),
                     "subtask": "indirect_prompt_injection",
                 },
             }
@@ -1175,9 +1181,7 @@ def _build_swe_pivot(
     raw = _load_jsonl(SWE_PIVOT_DATASET, filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
-        prompt, tool_defs, tool_results = _prepare_prompt(
-            row.get("responses_create_params"), system_prompt, native_tool_calls
-        )
+        prompt, tool_defs = _prepare_prompt(row.get("responses_create_params"), system_prompt, native_tool_calls)
         expected = _coerce(row.get("expected_action"))
         if not prompt or not isinstance(expected, dict):
             continue
@@ -1193,7 +1197,6 @@ def _build_swe_pivot(
                     "repo": str(metadata.get("repo", "")),
                     "instance_id": str(metadata.get("instance_id", "")),
                     "tool_defs_json": json.dumps(tool_defs, default=str),
-                    "tool_result_map_json": json.dumps(tool_results, default=str),
                     "subtask": "swe_pivot",
                 },
             }
@@ -1221,27 +1224,23 @@ def _tool_use_env(
     system_prompt,
     enable_native_tool_calls=True,
 ) -> vf.Environment:
-    def _train() -> Dataset:
+    def _build(num_examples: int) -> Dataset:
         return _build_tool_use(
             "train.jsonl",
-            num_train_examples,
+            num_examples,
             dataset_seed,
             system_prompt,
             enable_native_tool_calls,
         )
 
-    def _eval() -> Dataset:
-        return _build_tool_use(
-            "train.jsonl",
-            num_eval_examples,
-            dataset_seed + 1,
-            system_prompt,
-            enable_native_tool_calls,
-        )
+    train_dataset, eval_dataset = _make_disjoint_dataset_builders(_build, num_train_examples, num_eval_examples)
 
     rubric = _make_action_rubric()
     return DatasetToolCallingEnv(
-        dataset=_train, eval_dataset=_eval, rubric=rubric, system_prompt=system_prompt,
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        rubric=rubric,
+        system_prompt=system_prompt,
         enable_native_tool_calls=enable_native_tool_calls,
     )
 
@@ -1256,10 +1255,10 @@ def _tool_use_pivot_env(
     system_prompt,
     enable_native_tool_calls=True,
 ) -> vf.Environment:
-    def _train() -> Dataset:
+    def _build(num_examples: int) -> Dataset:
         return _build_tool_use(
             "train.jsonl",
-            num_train_examples,
+            num_examples,
             dataset_seed,
             system_prompt,
             enable_native_tool_calls,
@@ -1267,20 +1266,14 @@ def _tool_use_pivot_env(
             "tool_use_pivot",
         )
 
-    def _eval() -> Dataset:
-        return _build_tool_use(
-            "train.jsonl",
-            num_eval_examples,
-            dataset_seed + 1,
-            system_prompt,
-            enable_native_tool_calls,
-            TOOL_USE_PIVOT_DATASET,
-            "tool_use_pivot",
-        )
+    train_dataset, eval_dataset = _make_disjoint_dataset_builders(_build, num_train_examples, num_eval_examples)
 
     rubric = _make_action_rubric()
     return DatasetToolCallingEnv(
-        dataset=_train, eval_dataset=_eval, rubric=rubric, system_prompt=system_prompt,
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        rubric=rubric,
+        system_prompt=system_prompt,
         enable_native_tool_calls=enable_native_tool_calls,
     )
 
@@ -1295,27 +1288,23 @@ def _function_calling_env(
     system_prompt,
     enable_native_tool_calls=True,
 ) -> vf.Environment:
-    def _train() -> Dataset:
+    def _build(num_examples: int) -> Dataset:
         return _build_function_calling(
             "train.jsonl",
-            num_train_examples,
+            num_examples,
             dataset_seed,
             system_prompt,
             enable_native_tool_calls,
         )
 
-    def _eval() -> Dataset:
-        return _build_function_calling(
-            "train.jsonl",
-            num_eval_examples,
-            dataset_seed + 1,
-            system_prompt,
-            enable_native_tool_calls,
-        )
+    train_dataset, eval_dataset = _make_disjoint_dataset_builders(_build, num_train_examples, num_eval_examples)
 
     rubric = _make_action_rubric()
     return DatasetToolCallingEnv(
-        dataset=_train, eval_dataset=_eval, rubric=rubric, system_prompt=system_prompt,
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        rubric=rubric,
+        system_prompt=system_prompt,
         enable_native_tool_calls=enable_native_tool_calls,
     )
 
@@ -1352,7 +1341,10 @@ def _workplace_env(
     rubric.add_metric(emitted_tool_call)
     rubric.add_metric(tool_call_shape)
     return DatasetToolCallingEnv(
-        dataset=_train, eval_dataset=_eval, rubric=rubric, system_prompt=system_prompt,
+        dataset=_train,
+        eval_dataset=_eval,
+        rubric=rubric,
+        system_prompt=system_prompt,
         enable_native_tool_calls=enable_native_tool_calls,
     )
 
@@ -1367,30 +1359,26 @@ def _indirect_prompt_injection_env(
     system_prompt,
     enable_native_tool_calls=True,
 ) -> vf.Environment:
-    def _train() -> Dataset:
+    def _build(num_examples: int) -> Dataset:
         return _build_indirect_prompt_injection(
             "train.jsonl",
-            num_train_examples,
+            num_examples,
             dataset_seed,
             system_prompt,
             enable_native_tool_calls,
         )
 
-    def _eval() -> Dataset:
-        return _build_indirect_prompt_injection(
-            "train.jsonl",
-            num_eval_examples,
-            dataset_seed + 1,
-            system_prompt,
-            enable_native_tool_calls,
-        )
+    train_dataset, eval_dataset = _make_disjoint_dataset_builders(_build, num_train_examples, num_eval_examples)
 
     rubric = vf.Rubric(funcs=[ipi_resistance])
     rubric.add_metric(ipi_target_tool_called)
     rubric.add_metric(emitted_tool_call)
     rubric.add_metric(tool_call_shape)
     return DatasetToolCallingEnv(
-        dataset=_train, eval_dataset=_eval, rubric=rubric, system_prompt=system_prompt,
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        rubric=rubric,
+        system_prompt=system_prompt,
         enable_native_tool_calls=enable_native_tool_calls,
     )
 
@@ -1405,27 +1393,23 @@ def _swe_pivot_env(
     system_prompt,
     enable_native_tool_calls=True,
 ) -> vf.Environment:
-    def _train() -> Dataset:
+    def _build(num_examples: int) -> Dataset:
         return _build_swe_pivot(
             "train.jsonl",
-            num_train_examples,
+            num_examples,
             dataset_seed,
             system_prompt,
             enable_native_tool_calls,
         )
 
-    def _eval() -> Dataset:
-        return _build_swe_pivot(
-            "train.jsonl",
-            num_eval_examples,
-            dataset_seed + 1,
-            system_prompt,
-            enable_native_tool_calls,
-        )
+    train_dataset, eval_dataset = _make_disjoint_dataset_builders(_build, num_train_examples, num_eval_examples)
 
     rubric = _make_action_rubric()
     return DatasetToolCallingEnv(
-        dataset=_train, eval_dataset=_eval, rubric=rubric, system_prompt=system_prompt,
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        rubric=rubric,
+        system_prompt=system_prompt,
         enable_native_tool_calls=enable_native_tool_calls,
     )
 
@@ -1545,8 +1529,13 @@ def load_environment(
     names: list[str] = []
     for key in keys:
         env = _LOADERS[key](
-            judge_client, judge_model, judge_sampling_args,
-            num_train_examples, num_eval_examples, dataset_seed, system_prompt,
+            judge_client,
+            judge_model,
+            judge_sampling_args,
+            num_train_examples,
+            num_eval_examples,
+            dataset_seed,
+            system_prompt,
             enable_native_tool_calls,
         )
         envs.append(guard_env(env, guard_config))

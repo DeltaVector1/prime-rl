@@ -18,6 +18,7 @@ A flexible single-turn math problem evaluation environment that supports multipl
 - **Type**: single-turn
 - **Parser**: `StrictMaybeThinkParser` with boxed answer extraction
 - **Rubric overview**: `HybridMathRubric` with `math_verify_score`, `judge_score`, and `correct_answer`
+- **Reasoning guard**: truncated outputs, unclosed `<think>` tags, reasoning-only outputs, and visible answers without a reasoning trace are hard-zeroed by default
 
 ### Environment variables
 
@@ -110,6 +111,8 @@ prime eval run math-env \
 | `system_prompt` | str \| None | `None` | The system prompt to use for the environment |
 | `instruction_prompt` | str | `DEFAULT_INSTRUCTION_PROMPT` | The prompt to use for the instruction |
 | `math_verify_timeout` | int | `5` | The timeout in seconds for math verification |
+| `enable_zero_guardrails` | bool | `True` | Hard-zero truncated or malformed reasoning/output shapes before task scoring |
+| `reasoning_required` | bool | `True` | Require a reasoning trace when visible output is present |
 | `python_tool` | bool | `False` | Whether to enable Python tool use (uses `PythonEnv` instead of `SingleTurnEnv`) |
 | `max_turns` | int | `100` | The maximum number of turns to allow |
 | `max_startup_wait_seconds` | int | `60` | The maximum startup wait time in seconds |

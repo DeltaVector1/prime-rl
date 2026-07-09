@@ -56,7 +56,12 @@ After a restart, verify all processes are back up and progress resumed before th
 - `scripts/tmux.sh` launches the run with a `Launcher` window in the named tmux session. The Claude window receives the output dir and session name in its appended prompt — if either is missing, **ask** rather than guess.
 - `{output_dir}/configs/` — resolved TOMLs (`rl.toml` has the full picture).
 - `{output_dir}/logs/` — see below.
-- `{output_dir}/rollouts/step_N/` — saved rollouts.
+- `{output_dir}/rollouts/step_N/` — saved rollouts for a single unnamed run.
+- `{output_dir}/{run_id}/rollouts/step_N/` — saved rollouts when the orchestrator uses a named run. Resolve the actual path before inspecting files:
+
+```bash
+find {output_dir} -type f -path '*/rollouts/step_*/train_rollouts.jsonl' | sort -V | tail -1
+```
 
 ### Logs
 
@@ -135,16 +140,18 @@ curl -s http://localhost:8000/metrics | grep -E "num_requests|gpu_cache_usage"
 ### Rollouts
 
 ```
-{output_dir}/rollouts/step_N/
+{rollout_root}/step_N/
 ├── train_rollouts.jsonl   # all train rollouts (vf.RolloutOutput, trajectory excluded)
 ├── eval_rollouts.jsonl    # only present when eval ran
 └── train_rollouts.bin     # binary batch consumed by the trainer
 ```
 
+The complete audit stream, including trajectory and judge details when enabled, is `{rollout_root}/rollouts.jsonl`.
+
 ```bash
-wc -l {output_dir}/rollouts/step_42/train_rollouts.jsonl
-head -1 {output_dir}/rollouts/step_42/train_rollouts.jsonl | python -m json.tool
-jq '.reward' {output_dir}/rollouts/step_42/train_rollouts.jsonl
+wc -l {rollout_root}/step_42/train_rollouts.jsonl
+head -1 {rollout_root}/step_42/train_rollouts.jsonl | uv run python -m json.tool
+jq '.reward' {rollout_root}/step_42/train_rollouts.jsonl
 ```
 
 ### Common failure modes
