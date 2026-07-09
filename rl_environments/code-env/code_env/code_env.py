@@ -26,6 +26,46 @@ logger = logging.getLogger("verifiers.code_env")
 DEFAULT_INSTRUCTION_PROMPT = "Solve the programming task below in a Python markdown code block."
 
 
+def _is_empty_model_response_error(error):
+    return isinstance(error, vf.EmptyModelResponseError)
+
+
+def _mark_empty_model_response_zero(state: vf.State, error: vf.EmptyModelResponseError) -> None:
+    reason = str(error)
+    state["error"] = None
+    state["reward"] = 0.0
+    state["is_completed"] = True
+    state["stop_condition"] = "empty_model_response_zero_guard"
+    breakdown = {
+        "empty_model_response_zero_guard": 1.0,
+        "empty_model_response_reasoning_only": float("reasoning but no content" in reason),
+        "empty_model_response_reason": reason,
+        "final_reward_formula": "0 because the model returned no visible answer/tool call",
+    }
+    state.setdefault("reward_breakdown", {})["empty_model_response_zero_guard"] = breakdown
+    metrics = dict(state.get("metrics", {}) or {})
+    metrics.update({key: value for key, value in breakdown.items() if isinstance(value, int | float)})
+    state["metrics"] = metrics
+
+
+class ZeroOnEmptyModelResponseMixin:
+    async def _run_rollout_state(self, input, client, model: str, sampling_args):
+        state = await self.rollout(input, client, model, sampling_args)
+        state["timing"].scoring.start = time.time()
+        if _is_empty_model_response_error(state.get("error")):
+            _mark_empty_model_response_zero(state, state["error"])
+            state["timing"].scoring.end = time.time()
+            await self.rubric.cleanup(state)
+            return state
+        if self.score_rollouts:
+            await self.rubric.score_rollout(state)
+        else:
+            await self.rubric.dummy_score_rollout(state)
+        state["timing"].scoring.end = time.time()
+        await self.rubric.cleanup(state)
+        return state
+
+
 # Early check for available file descriptors
 def check_file_descriptor_limit(min_limit=65536):
     try:
@@ -42,7 +82,7 @@ def check_file_descriptor_limit(min_limit=65536):
         raise RuntimeError(f"Could not check file descriptor limit (RLIMIT_NOFILE): {e}")
 
 
-class SandboxEnv(SandboxMixin, vf.SingleTurnEnv):
+class SandboxEnv(ZeroOnEmptyModelResponseMixin, SandboxMixin, vf.SingleTurnEnv):
     def __init__(
         self,
         sandbox_name: str = "sandbox-env",
@@ -188,7 +228,7 @@ class CodingEnv(SandboxEnv):
         state["sandbox_error"] = 1
 
 
-class LocalCodingEnv(vf.SingleTurnEnv):
+class LocalCodingEnv(ZeroOnEmptyModelResponseMixin, vf.SingleTurnEnv):
     def __init__(
         self,
         *,

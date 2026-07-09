@@ -2,6 +2,7 @@ import ast
 import asyncio
 import os
 import re
+import time
 from typing import Any, Callable
 
 import httpx
@@ -94,8 +95,51 @@ class StrictMaybeThinkParser(vf.MaybeThinkParser):
         return super().parse(text)
 
 
-# Upstream this into vf.SandboxEnv
-class PythonEnvWithLabels(vf.PythonEnv):
+def _is_empty_model_response_error(error: Any) -> bool:
+    return isinstance(error, vf.EmptyModelResponseError)
+
+
+def _mark_empty_model_response_zero(state: vf.State, error: vf.EmptyModelResponseError) -> None:
+    reason = str(error)
+    state["error"] = None
+    state["reward"] = 0.0
+    state["is_completed"] = True
+    state["stop_condition"] = "empty_model_response_zero_guard"
+    breakdown = {
+        "empty_model_response_zero_guard": 1.0,
+        "empty_model_response_reasoning_only": float("reasoning but no content" in reason),
+        "empty_model_response_reason": reason,
+        "final_reward_formula": "0 because the model returned no visible answer/tool call",
+    }
+    state.setdefault("reward_breakdown", {})["empty_model_response_zero_guard"] = breakdown
+    metrics = dict(state.get("metrics", {}) or {})
+    metrics.update({key: value for key, value in breakdown.items() if isinstance(value, int | float)})
+    state["metrics"] = metrics
+
+
+class ZeroOnEmptyModelResponseMixin:
+    async def _run_rollout_state(self, input, client, model: str, sampling_args):
+        state = await self.rollout(input, client, model, sampling_args)
+        state["timing"].scoring.start = time.time()
+        if _is_empty_model_response_error(state.get("error")):
+            _mark_empty_model_response_zero(state, state["error"])
+            state["timing"].scoring.end = time.time()
+            await self.rubric.cleanup(state)
+            return state
+        if self.score_rollouts:
+            await self.rubric.score_rollout(state)
+        else:
+            await self.rubric.dummy_score_rollout(state)
+        state["timing"].scoring.end = time.time()
+        await self.rubric.cleanup(state)
+        return state
+
+
+class ZeroOnEmptyModelResponseSingleTurnEnv(ZeroOnEmptyModelResponseMixin, vf.SingleTurnEnv):
+    pass
+
+
+class PythonEnvWithLabels(ZeroOnEmptyModelResponseMixin, vf.PythonEnv):
     """PythonEnv that adds sandbox labels."""
 
     def __init__(self, sandbox_labels: list[str] = ["math-env"], *args, **kwargs):
@@ -400,5 +444,9 @@ def load_environment(
             **kwargs,
         )
     else:
-        env = vf.SingleTurnEnv(dataset=build_dataset, rubric=rubric, system_prompt=system_prompt)
+        env = ZeroOnEmptyModelResponseSingleTurnEnv(
+            dataset=build_dataset,
+            rubric=rubric,
+            system_prompt=system_prompt,
+        )
     return env
