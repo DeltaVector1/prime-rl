@@ -497,14 +497,80 @@ def _is_empty_model_response_error(error: Any) -> bool:
     return isinstance(error, vf.EmptyModelResponseError)
 
 
+EMPTY_MODEL_RESPONSE_SENTINEL = "[empty model response: no visible answer or tool call]"
+
+
+def _plain_messages(messages: Any) -> list[dict[str, Any]]:
+    if isinstance(messages, str):
+        return [{"role": "user", "content": messages}]
+    if not isinstance(messages, list):
+        return []
+
+    plain: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, dict):
+            plain.append(dict(message))
+            continue
+        dump = getattr(message, "model_dump", None)
+        if callable(dump):
+            plain.append(dump(exclude_none=True))
+            continue
+        plain.append(
+            {
+                "role": str(getattr(message, "role", "user")),
+                "content": getattr(message, "content", str(message)),
+            }
+        )
+    return plain
+
+
+def _ensure_empty_model_response_trajectory(state: vf.State, reason: str) -> None:
+    if state.get("trajectory"):
+        return
+
+    prompt = _plain_messages(state.get("prompt") or [])
+    completion = [{"role": "assistant", "content": EMPTY_MODEL_RESPONSE_SENTINEL}]
+    state["completion"] = completion
+    state.setdefault("raw_completion", EMPTY_MODEL_RESPONSE_SENTINEL)
+    state["trajectory"] = [
+        {
+            "prompt": prompt,
+            "completion": completion,
+            "response": vf.Response(
+                id=f"{state.get('trajectory_id', 'empty')}-empty-response-zero-guard",
+                created=int(time.time()),
+                model=str(state.get("model") or ""),
+                usage=None,
+                message=vf.ResponseMessage(
+                    content=EMPTY_MODEL_RESPONSE_SENTINEL,
+                    finish_reason="stop",
+                    is_truncated=False,
+                    tokens=None,
+                ),
+            ),
+            "tokens": None,
+            "reward": 0.0,
+            "advantage": None,
+            "is_truncated": False,
+            "trajectory_id": str(state.get("trajectory_id", "")),
+            "extras": {
+                "empty_model_response_zero_guard": True,
+                "empty_model_response_reason": reason,
+            },
+        }
+    ]
+
+
 def _mark_empty_model_response_zero(state: vf.State, error: vf.EmptyModelResponseError) -> None:
     reason = str(error)
+    _ensure_empty_model_response_trajectory(state, reason)
     state["error"] = None
     state["reward"] = 0.0
     state["is_completed"] = True
     state["stop_condition"] = "empty_model_response_zero_guard"
     breakdown = {
         "empty_model_response_zero_guard": 1.0,
+        "empty_model_response_synthetic_step": 1.0,
         "empty_model_response_reasoning_only": float("reasoning but no content" in reason),
         "empty_model_response_reason": reason,
         "final_reward_formula": "0 because the model returned no visible answer/tool call",
