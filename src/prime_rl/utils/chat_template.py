@@ -40,6 +40,8 @@ def normalize_messages(messages: Any, default_role: str) -> list[dict[str, Any]]
 
 def deserialize_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def _deserialize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+        if "function" not in tool_call:
+            return dict(tool_call)
         function = tool_call.get("function", {})
         arguments = function.get("arguments")
         if isinstance(arguments, str):

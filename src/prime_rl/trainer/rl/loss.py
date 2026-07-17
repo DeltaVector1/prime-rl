@@ -6,7 +6,7 @@ from beartype import beartype as typechecker
 from jaxtyping import Bool, Float, Int, jaxtyped
 from torch import Tensor
 
-from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig
+from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, IPOLossConfig, LossConfig, OPDLossConfig
 from prime_rl.utils.utils import import_object
 
 
@@ -19,6 +19,8 @@ class LossInputs:
     teacher_logprobs: Float[Tensor, " seq"] | None
     advantages: Float[Tensor, " seq"]
     loss_mask: Bool[Tensor, " seq"]
+    rewards: Float[Tensor, " seq"] | None = None
+    environment_mask: Bool[Tensor, " seq"] | None = None
 
 
 @dataclass
@@ -194,12 +196,13 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: IPOLossConfig) -> LossOutputs:
     return LossOutputs(loss=loss, metrics=metrics)
 
 
-def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
+def opd_loss_fn(inputs: LossInputs, loss_config: OPDLossConfig | None = None) -> LossOutputs:
     """
-    On-policy distillation loss: the default DPPO+KL math with the tau knobs
-    hardcoded to drop the reward signal and use the teacher KL as the
-    per-token policy-gradient signal.
+    On-policy distillation loss combining per-token teacher KL with an
+    optional group-relative rollout reward advantage.
     """
+    if loss_config is None:
+        loss_config = OPDLossConfig()
     trainer_logprobs = inputs.trainer_logprobs
     inference_logprobs = inputs.inference_logprobs
     teacher_logprobs = inputs.teacher_logprobs
@@ -213,9 +216,21 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
         trainer_logprobs, inference_logprobs
     )
 
+    teacher_kl = teacher_logprobs - inference_logprobs
+    if loss_config.reward_gate_teacher:
+        if inputs.rewards is None:
+            raise ValueError("reward_gate_teacher requires per-token rollout rewards.")
+        teacher_gate = inputs.rewards > 0
+    else:
+        teacher_gate = torch.ones_like(loss_mask)
+    teacher_advantages = torch.where(teacher_gate, teacher_kl, 0.0)
+    reward_advantages = inputs.advantages
+    advantages = (
+        loss_config.teacher_tau * teacher_advantages + loss_config.reward_tau * reward_advantages
+    ).detach()
     probs_diff = torch.exp(trainer_logprobs) - torch.exp(inference_logprobs)
-    dppo_invalid_mask_high = probs_diff > 0.2
-    dppo_invalid_mask_low = probs_diff < -0.2
+    dppo_invalid_mask_high = probs_diff > loss_config.dppo_mask_high
+    dppo_invalid_mask_low = probs_diff < -loss_config.dppo_mask_low
     positive_advantages = advantages > 0
     negative_advantages = advantages < 0
     dppo_invalid_mask = torch.where(positive_advantages, dppo_invalid_mask_high, dppo_invalid_mask_low)
@@ -226,12 +241,9 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
     drop_mask = loss_mask & is_masked
     keep_mask = loss_mask & ~is_masked
 
-    teacher_kl = teacher_logprobs - trainer_logprobs
-    advantages = 0.0 * advantages + 1.0 * teacher_kl.detach()
-
     pg_loss = keep_mask * advantages * importance_ratio
     kl_loss = loss_mask * log_importance_ratio**2
-    loss = (-pg_loss + 1e-3 * kl_loss).sum()
+    loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
 
     metrics = {
         "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & is_masked),
@@ -242,6 +254,9 @@ def opd_loss_fn(inputs: LossInputs) -> LossOutputs:
         "masked_advantage_positive": _safe_mean(positive_advantages, drop_mask),
         "masked_advantage_negative": _safe_mean(negative_advantages, drop_mask),
         "teacher_kl": _safe_mean(teacher_kl, loss_mask),
+        "teacher_gate": _safe_mean(teacher_gate, loss_mask),
+        "reward_advantage": _safe_mean(reward_advantages, loss_mask),
+        "combined_advantage": _safe_mean(advantages, loss_mask),
     }
 
     return LossOutputs(loss=loss, metrics=metrics)
@@ -259,7 +274,35 @@ def sft_loss_fn(inputs: LossInputs) -> LossOutputs:
     return LossOutputs(loss=loss, metrics=metrics)
 
 
-def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
+def echo_loss_fn(inputs: LossInputs, rl_loss_fn: LossFn, echo_alpha: float) -> LossOutputs:
+    """GRPO/IPO on policy tokens plus cross-entropy on environment observations."""
+    environment_mask = inputs.environment_mask
+    if environment_mask is None:
+        raise ValueError("echo_loss_fn requires an environment token mask.")
+
+    policy_mask = inputs.loss_mask & ~environment_mask
+    rl_result = rl_loss_fn(
+        LossInputs(
+            trainer_logprobs=inputs.trainer_logprobs,
+            inference_logprobs=inputs.inference_logprobs,
+            teacher_logprobs=inputs.teacher_logprobs,
+            advantages=inputs.advantages,
+            loss_mask=policy_mask,
+            rewards=inputs.rewards,
+            environment_mask=environment_mask,
+        )
+    )
+    environment_nll = -inputs.trainer_logprobs[environment_mask].sum()
+    loss = rl_result.loss + echo_alpha * environment_nll
+    metrics = {
+        **rl_result.metrics,
+        "echo_nll": _safe_mean(-inputs.trainer_logprobs, environment_mask),
+        "echo_token_fraction": environment_mask.sum() / torch.clamp_min(inputs.loss_mask.sum(), 1),
+    }
+    return LossOutputs(loss=loss, metrics=metrics)
+
+
+def setup_loss_fns(loss_config: LossConfig, opd_loss_config: OPDLossConfig | None = None) -> dict[str, LossFn]:
     """Build the per-training-mode loss fn dispatch table.
 
     Always returns all three modes - the trainer is mode-agnostic and routes
@@ -289,7 +332,16 @@ def setup_loss_fns(loss_config: LossConfig) -> dict[str, LossFn]:
         def rl_fn(inputs: LossInputs) -> LossOutputs:
             return default_loss_fn(inputs, loss_config)
 
-    return {"sft": sft_loss_fn, "opd": opd_loss_fn, "rl": rl_fn}
+    if opd_loss_config is None:
+        opd_loss_config = OPDLossConfig()
+
+    def opd_fn(inputs: LossInputs) -> LossOutputs:
+        return opd_loss_fn(inputs, opd_loss_config)
+
+    def echo_fn(inputs: LossInputs) -> LossOutputs:
+        return echo_loss_fn(inputs, rl_fn, loss_config.echo_alpha)
+
+    return {"sft": sft_loss_fn, "opd": opd_fn, "rl": rl_fn, "echo": echo_fn}
 
 
 def compute_loss(
@@ -301,6 +353,8 @@ def compute_loss(
     loss_fns: dict[str, LossFn],
     loss_scale: int,
     training_mode: str = "rl",
+    environment_mask: list[Bool[Tensor, " seq_i"]] | None = None,
+    rewards: list[Float[Tensor, " seq_i"]] | None = None,
 ) -> tuple[Float[Tensor, ""], dict[str, Any]]:
     """
     Compute loss for packed sequences (batch size = 1, multiple sequences packed along sequence dimension).
@@ -335,13 +389,20 @@ def compute_loss(
 
     if teacher_logprobs is None:
         teacher_logprobs = [None] * len(trainer_logprobs)
+    if environment_mask is None:
+        environment_mask = [torch.zeros_like(mask) for mask in loss_mask]
+    if rewards is None:
+        rewards = [None] * len(trainer_logprobs)
 
-    for t_logp, i_logp, teach_logp, adv, mask in zip(
+    for t_logp, i_logp, teach_logp, adv, mask, env_mask, reward in zip(
         trainer_logprobs,
         inference_logprobs,
         teacher_logprobs,
         advantages,
         loss_mask,
+        environment_mask,
+        rewards,
+        strict=True,
     ):
         inputs = LossInputs(
             trainer_logprobs=t_logp,
@@ -349,6 +410,8 @@ def compute_loss(
             teacher_logprobs=teach_logp,
             advantages=adv,
             loss_mask=mask,
+            rewards=reward,
+            environment_mask=env_mask,
         )
 
         result = effective_loss_fn(inputs)

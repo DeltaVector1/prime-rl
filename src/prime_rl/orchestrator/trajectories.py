@@ -201,11 +201,77 @@ def backfill_rollout_tokens(
     return True
 
 
+def build_environment_prompt_masks(
+    output: vf.RolloutOutput,
+    tokenizer: PreTrainedTokenizer,
+    renderer=None,
+) -> list[list[bool]]:
+    """Mark newly returned tool-response tokens in each trajectory prompt."""
+    tools = _convert_tools_to_oai_format(output.get("tool_defs", []))
+    masks: list[list[bool]] = []
+
+    for step_idx, step in enumerate(output["trajectory"]):
+        tokens = step["tokens"]
+        if tokens is None:
+            raise ValueError(f"Missing tokens for ECHO example {output['example_id']} step {step_idx}")
+
+        expected_prompt_ids = list(tokens["prompt_ids"])
+        prompt = _normalize_messages(step.get("prompt"), default_role="user")
+        trailing_tool_indices: list[int] = []
+        if step_idx > 0:
+            for message_idx in range(len(prompt) - 1, -1, -1):
+                if prompt[message_idx].get("role") != "tool":
+                    break
+                trailing_tool_indices.append(message_idx)
+        if not trailing_tool_indices:
+            masks.append([False] * len(expected_prompt_ids))
+            continue
+
+        has_completion = bool(_normalize_messages(step.get("completion"), default_role="assistant"))
+
+        def render_prompt(messages: list[dict[str, Any]]) -> list[int]:
+            if renderer is not None:
+                return list(renderer.render_ids(messages, tools=tools, add_generation_prompt=has_completion))
+            return _render_messages(
+                tokenizer,
+                messages,
+                add_generation_prompt=has_completion,
+                tools=tools,
+            )
+
+        rendered_prompt_ids = render_prompt(prompt)
+        if rendered_prompt_ids != expected_prompt_ids:
+            raise ValueError(
+                f"Cannot align ECHO prompt tokens for example {output['example_id']} step {step_idx}: "
+                f"rendered {len(rendered_prompt_ids)} tokens, rollout recorded {len(expected_prompt_ids)}"
+            )
+
+        mask = [False] * len(rendered_prompt_ids)
+        for message_idx in trailing_tool_indices:
+            counterfactual = [dict(message) for message in prompt]
+            counterfactual[message_idx]["content"] = " "
+            counterfactual_ids = render_prompt(counterfactual)
+
+            start = _common_prefix_len(rendered_prompt_ids, counterfactual_ids)
+            max_suffix = min(len(rendered_prompt_ids), len(counterfactual_ids)) - start
+            suffix = 0
+            while suffix < max_suffix and rendered_prompt_ids[-(suffix + 1)] == counterfactual_ids[-(suffix + 1)]:
+                suffix += 1
+            end = len(rendered_prompt_ids) - suffix
+            mask[start:end] = [True] * (end - start)
+
+        masks.append(mask)
+
+    return masks
+
+
 def interleave_rollout(
     output: vf.RolloutOutput,
     mm_token_type_ids_mapping: dict[int, int] | None = None,
     *,
     env_name: str = "",
+    environment_supervision: bool = False,
+    environment_prompt_masks: list[list[bool]] | None = None,
 ) -> list[TrainingSample] | None:
     """
     Convert vf.RolloutOutput to trainable rollouts by interleaving trajectory steps
@@ -238,6 +304,9 @@ def interleave_rollout(
         return None
 
     has_error = output["error"] is not None
+    if environment_supervision:
+        assert environment_prompt_masks is not None, "ECHO requires environment prompt masks"
+        assert len(environment_prompt_masks) == len(trajectory)
 
     def prepare_step_tokens(step: vf.TrajectoryStep, step_idx: int) -> dict[str, Any] | None:
         tokens = step["tokens"]
@@ -255,6 +324,11 @@ def interleave_rollout(
             return {
                 "prompt_ids": list(tokens["prompt_ids"]),
                 "prompt_mask": list(map(bool, tokens["prompt_mask"])),
+                "prompt_environment_mask": (
+                    list(environment_prompt_masks[step_idx])
+                    if environment_prompt_masks is not None
+                    else [False] * len(tokens["prompt_ids"])
+                ),
                 "completion_ids": list(tokens["completion_ids"]),
                 "completion_mask": list(map(bool, tokens["completion_mask"])),
                 "completion_logprobs": list(tokens["completion_logprobs"]),
@@ -296,6 +370,8 @@ def interleave_rollout(
         completion_ids = list(tokens["completion_ids"])
 
         prompt_ids = list(tokens["prompt_ids"])
+        prompt_environment_mask = list(tokens["prompt_environment_mask"])
+        assert len(prompt_environment_mask) == len(prompt_ids)
         sample = TrainingSample(
             prompt_ids=prompt_ids,
             prompt_mask=list(tokens["prompt_mask"]),
@@ -308,6 +384,8 @@ def interleave_rollout(
             env_name=env_name,
             mm_token_type_ids=None,
             routed_experts=None,  # deferred — finalized at end of interleave_rollout
+            completion_environment_mask=([False] * len(completion_ids) if environment_supervision else None),
+            prompt_environment_mask=(prompt_environment_mask if environment_supervision else None),
         )
         # Initialize routed-experts state for this sample. First chunk is the
         # raw step routed_experts (no pad, no copy). running_len is the
@@ -375,6 +453,10 @@ def interleave_rollout(
         sample.completion_ids.extend(new_prompt_ids)
         sample.completion_mask.extend([False] * len(new_prompt_ids))
         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
+        if sample.completion_environment_mask is not None:
+            new_environment_mask = tokens["prompt_environment_mask"][prefix_len:]
+            assert len(new_environment_mask) == len(new_prompt_ids)
+            sample.completion_environment_mask.extend(new_environment_mask)
 
         # Extend with new completion tokens
         completion_ids = tokens["completion_ids"]
@@ -384,6 +466,8 @@ def interleave_rollout(
         else:
             sample.completion_mask.extend(tokens["completion_mask"])
         sample.completion_logprobs.extend(tokens["completion_logprobs"])
+        if sample.completion_environment_mask is not None:
+            sample.completion_environment_mask.extend([False] * len(completion_ids))
 
         step_routed = tokens.get("routed_experts")
         state = sample_routed_state.get(id(sample))

@@ -16,7 +16,7 @@ from prime_sandboxes import (
 from verifiers.envs.experimental.sandbox_mixin import SandboxMixin
 from verifiers.envs.sandbox_env import AdvancedConfigs
 
-from .reasoning_guard import ReasoningGuardRubric, reasoning_guard_breakdown
+from .reasoning_guard import ReasoningGuardRubric, _rollout_is_truncated, reasoning_guard_breakdown
 from .utils.deepcoder_utils import extract_code_from_model
 from .utils.local_verification_utils import run_test_cases_local
 from .utils.verification_utils import run_test_cases
@@ -99,6 +99,7 @@ def _mark_empty_model_response_zero(state: vf.State, error: vf.EmptyModelRespons
     _ensure_empty_model_response_trajectory(state, reason)
     state["error"] = None
     state["reward"] = 0.0
+    state["skip_training"] = True
     state["is_completed"] = True
     state["stop_condition"] = "empty_model_response_zero_guard"
     breakdown = {
@@ -130,6 +131,14 @@ class ZeroOnEmptyModelResponseMixin:
         state["timing"].scoring.end = time.time()
         await self.rubric.cleanup(state)
         return state
+
+    async def _run_group_states(self, group_inputs, client, model: str, sampling_args):
+        states = await super()._run_group_states(group_inputs, client, model, sampling_args)
+        for state in states:
+            error = state.get("error")
+            if _is_empty_model_response_error(error):
+                _mark_empty_model_response_zero(state, error)
+        return states
 
 
 # Early check for available file descriptors
@@ -221,7 +230,11 @@ class CodingEnv(SandboxEnv):
             return
         completion = trajectory[-1]["completion"]
         if self.enable_zero_guardrails:
-            breakdown = reasoning_guard_breakdown(completion, reasoning_required=self.reasoning_required)
+            breakdown = reasoning_guard_breakdown(
+                completion,
+                reasoning_required=self.reasoning_required,
+                is_truncated=_rollout_is_truncated(state),
+            )
             state.setdefault("reward_breakdown", {})["reasoning_zero_guard"] = breakdown
             if breakdown["reasoning_zero_guard_multiplier"] == 0.0:
                 state["reasoning_zero_guard_skipped_tests"] = 1
@@ -317,7 +330,11 @@ class LocalCodingEnv(ZeroOnEmptyModelResponseMixin, vf.SingleTurnEnv):
             return
         completion = trajectory[-1]["completion"]
         if self.enable_zero_guardrails:
-            breakdown = reasoning_guard_breakdown(completion, reasoning_required=self.reasoning_required)
+            breakdown = reasoning_guard_breakdown(
+                completion,
+                reasoning_required=self.reasoning_required,
+                is_truncated=_rollout_is_truncated(state),
+            )
             state.setdefault("reward_breakdown", {})["reasoning_zero_guard"] = breakdown
             if breakdown["reasoning_zero_guard_multiplier"] == 0.0:
                 state["reasoning_zero_guard_skipped_tests"] = 1
@@ -438,12 +455,15 @@ def load_environment(
     timeout_minutes: int = 360,
     instruction_prompt: str = DEFAULT_INSTRUCTION_PROMPT,
     random_seed: int | None = 42,
+    dataset_start_index: int = 0,
     use_local_sandbox: bool = True,
     enable_zero_guardrails: bool = True,
     reasoning_required: bool = True,
     **kwargs,
 ) -> vf.Environment:
     check_file_descriptor_limit()
+    if dataset_start_index < 0:
+        raise ValueError("dataset_start_index must be non-negative")
 
     if random_seed is not None:
         random.seed(random_seed)
@@ -463,6 +483,8 @@ def load_environment(
 
         if dataset_shuffle:
             dataset = dataset.shuffle(seed=random_seed)
+        if dataset_start_index:
+            dataset = dataset.skip(dataset_start_index)
 
         return dataset
 

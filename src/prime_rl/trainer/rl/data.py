@@ -30,6 +30,7 @@ class TensorMicroBatch(TypedDict):
     inference_logprobs: Float[Tensor, "batch seq"]
     teacher_logprobs: Float[Tensor, "batch seq"] | None
     loss_mask: Bool[Tensor, "batch seq"]
+    environment_mask: Bool[Tensor, "batch seq"]
     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
     env_names: list[str]
     sequence_lengths: list[int]
@@ -129,6 +130,7 @@ class FakeDataLoader:
             "env_names": ["fake"] * input_ids.shape[0],
             "sequence_lengths": sequence_lengths,
             "loss_mask": loss_mask.unsqueeze(0),
+            "environment_mask": torch.zeros_like(loss_mask).unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
             "routed_experts": None,
             "mm_kwargs": None,
@@ -160,6 +162,7 @@ class FakeDataLoader:
             "env_names": ["fake"] * self.seq_len,
             "sequence_lengths": [self.seq_len],
             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
+            "environment_mask": torch.zeros(self.seq_len, dtype=torch.bool).unsqueeze(0),
             "lora_num_tokens": lora_num_tokens,
             "routed_experts": None,
             "mm_kwargs": None,
@@ -255,6 +258,10 @@ class DataLoader:
             if micro_batch.teacher_logprobs is not None
             else None,
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
+            environment_mask=torch.tensor(
+                micro_batch.environment_mask or [False] * len(micro_batch.input_ids),
+                dtype=torch.bool,
+            ).unsqueeze(0),
             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             env_names=micro_batch.env_names,
             sequence_lengths=micro_batch.sequence_lengths,

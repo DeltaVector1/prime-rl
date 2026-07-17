@@ -2,7 +2,7 @@ from typing import Literal
 
 import msgspec
 
-TrainingMode = Literal["rl", "opd", "sft"]
+TrainingMode = Literal["rl", "opd", "sft", "echo"]
 
 
 # Encoded tensor: {dtype: "float32", shape: [...], data: <bytes>}.
@@ -36,6 +36,8 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     teacher_logprobs: list[float] | None = None
     advantage: float | None = None
     reward: float | None = None
+    completion_environment_mask: list[bool] | None = None
+    prompt_environment_mask: list[bool] | None = None
 
     # Generic multimodal kwargs: flat dict keyed by the kwarg names the
     # model's forward expects (e.g. {"pixel_values": ..., "image_grid_thw":
@@ -90,6 +92,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # sft → sft loss). All samples packed into a micro batch share the same mode.
     training_mode: TrainingMode = "rl"
     rewards: list[float] | None = None
+    environment_mask: list[bool] | None = None
 
     # Packer-derived metadata used for run-local token exports.
     run_id: str | None = None

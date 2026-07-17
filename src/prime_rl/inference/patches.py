@@ -1,3 +1,5 @@
+import os
+
 import torch
 from vllm.triton_utils import tl, triton
 
@@ -22,6 +24,111 @@ def transformers_v5_compat():
     monkey_patch_vllm_padded_input_scrub()
     monkey_patch_return_routed_experts_with_nixl_connector()
     monkey_patch_kv_xfer_finished_tolerate_freed()
+    monkey_patch_cutlass_cute_fmin()
+    monkey_patch_tilelang_after_worker_init()
+
+
+def monkey_patch_cutlass_cute_fmin():
+    """Restore the CuTeDSL floating-point minimum used by DeepSeek-V4."""
+    import cutlass.cute.arch as arch
+    from cutlass import Float32
+
+    if hasattr(arch, "fmin"):
+        return
+
+    def fmin(a, b):
+        return -arch.fmax(-Float32(a), -Float32(b))
+
+    arch.fmin = fmin
+
+
+def monkey_patch_tilelang_nvrtc_cpp20():
+    if os.environ.get("TILELANG_EXECUTION_BACKEND") != "nvrtc":
+        return
+
+    from tilelang.contrib import nvrtc
+
+    original_compile_cuda = nvrtc.compile_cuda
+    if getattr(original_compile_cuda, "_prime_rl_uses_cpp20", False):
+        return
+
+    integral_trait = """
+#ifdef __CUDACC_RTC__
+namespace std {
+template <class T> struct is_integral : false_type {};
+template <> struct is_integral<bool> : true_type {};
+template <> struct is_integral<char> : true_type {};
+template <> struct is_integral<signed char> : true_type {};
+template <> struct is_integral<unsigned char> : true_type {};
+template <> struct is_integral<short> : true_type {};
+template <> struct is_integral<unsigned short> : true_type {};
+template <> struct is_integral<int> : true_type {};
+template <> struct is_integral<unsigned int> : true_type {};
+template <> struct is_integral<long> : true_type {};
+template <> struct is_integral<unsigned long> : true_type {};
+template <> struct is_integral<long long> : true_type {};
+template <> struct is_integral<unsigned long long> : true_type {};
+template <class T> struct is_integral<const T> : is_integral<T> {};
+template <class T> struct is_integral<volatile T> : is_integral<T> {};
+template <class T> struct is_integral<const volatile T> : is_integral<T> {};
+template <class T> inline constexpr bool is_integral_v = is_integral<T>::value;
+}
+#endif
+"""
+
+    def compile_cuda(code, target_format="ptx", arch=None, options=None, verbose=False):
+        if isinstance(options, list):
+            options = ["-std=c++20" if option.startswith("-std=c++") else option for option in options]
+            if not any(option.startswith("-std=c++") for option in options):
+                options.append("-std=c++20")
+        elif isinstance(options, str) and options.startswith("-std=c++"):
+            options = "-std=c++20"
+        elif isinstance(options, str):
+            options = [options, "-std=c++20"]
+        else:
+            options = ["-std=c++20"]
+        return original_compile_cuda(integral_trait + code, target_format, arch, options, verbose)
+
+    compile_cuda._prime_rl_uses_cpp20 = True
+    nvrtc.compile_cuda = compile_cuda
+
+    from tilelang.jit.adapter.nvrtc import libgen
+
+    libgen.compile_cuda = compile_cuda
+
+
+def monkey_patch_cutedsl_fmin():
+    from cutlass import cute
+
+    if hasattr(cute.arch, "fmin"):
+        return
+
+    def fmin(left, right):
+        return -cute.arch.fmax(-left, -right)
+
+    cute.arch.fmin = fmin
+
+
+def monkey_patch_tilelang_after_worker_init():
+    if os.environ.get("TILELANG_EXECUTION_BACKEND") != "nvrtc":
+        return
+
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+    original_init_device = WorkerWrapperBase.init_device
+    if getattr(original_init_device, "_prime_rl_patches_tilelang", False):
+        return
+
+    def init_device(worker):
+        original_init_device(worker)
+        monkey_patch_tilelang_nvrtc_cpp20()
+        monkey_patch_cutedsl_fmin()
+        from vllm.utils.deep_gemm import is_deep_gemm_supported
+
+        is_deep_gemm_supported.cache_clear()
+
+    init_device._prime_rl_patches_tilelang = True
+    WorkerWrapperBase.init_device = init_device
 
 
 def monkey_patch_kv_xfer_finished_tolerate_freed():

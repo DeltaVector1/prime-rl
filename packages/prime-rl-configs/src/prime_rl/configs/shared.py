@@ -106,6 +106,9 @@ class ClientConfig(BaseConfig):
     connect_timeout: float = 30.0
     """TCP connect timeout in seconds for inference API requests."""
 
+    preserve_reasoning_only_responses: bool = False
+    """Forward token-bearing reasoning-only generations to the environment for scoring."""
+
     wait_for_ready_timeout: int = 1800
     """Seconds to wait at startup for the inference pool to become ready. Applies to both the static health check and elastic DNS-based discovery."""
 

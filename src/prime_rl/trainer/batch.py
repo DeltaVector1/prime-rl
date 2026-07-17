@@ -47,7 +47,23 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     Tokenize and prepare tensors.
     """
     input_ids = training_example.prompt_ids + training_example.completion_ids
-    loss_mask = training_example.prompt_mask + training_example.completion_mask
+    environment_mask = (
+        training_example.prompt_environment_mask
+        if training_example.prompt_environment_mask is not None
+        else [False] * len(training_example.prompt_ids)
+    ) + (
+        training_example.completion_environment_mask
+        if training_example.completion_environment_mask is not None
+        else [False] * len(training_example.completion_ids)
+    )
+    loss_mask = [
+        policy_token or environment_token
+        for policy_token, environment_token in zip(
+            training_example.prompt_mask + training_example.completion_mask,
+            environment_mask,
+            strict=True,
+        )
+    ]
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
     advantages = [training_example.advantage] * len(input_ids)
     reward = training_example.reward if training_example.reward is not None else float("nan")
@@ -77,6 +93,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         advantages = advantages[:seq_len]
         rewards = rewards[:seq_len]
         temperatures = temperatures[:seq_len]
+        environment_mask = environment_mask[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
         if routed_experts is not None:
@@ -126,6 +143,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         env_names=env_names,
         mm_kwargs=training_example.mm_kwargs,
         training_mode=training_example.training_mode,
+        environment_mask=environment_mask,
     )
 
 
@@ -199,6 +217,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     rewards: list[float] | None = [] if has_rewards else None
     teacher_logprobs: list[float] | None = [] if has_teacher_logprobs else None
     mm_token_type_ids: list[int] | None = [] if has_mm_token_type_ids else None
+    environment_mask: list[bool] = []
     routed_experts: RoutedExperts | None = None
     lora_num_tokens = [0] * num_loras
 
@@ -211,6 +230,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         position_ids.extend(sample.position_ids)
         temperatures.extend(sample.temperatures)
         env_names.extend(sample.env_names)
+        environment_mask.extend(sample.environment_mask or [False] * sample_len)
         if rewards is not None:
             rewards.extend(sample.rewards if sample.rewards is not None else [float("nan")] * sample_len)
         if teacher_logprobs is not None:
@@ -251,6 +271,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         env_names=env_names,
         mm_kwargs=first_sample.mm_kwargs if _is_multimodal_sample(first_sample) else None,
         training_mode=first_sample.training_mode,
+        environment_mask=environment_mask,
     )
 
 
@@ -352,6 +373,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     if micro_batch.rewards is not None:
         micro_batch.rewards.extend([float("nan")] * padding_size)
     micro_batch.loss_mask.extend([False] * padding_size)
+    if micro_batch.environment_mask is not None:
+        micro_batch.environment_mask.extend([False] * padding_size)
     micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.sequence_lengths.append(padding_size)
     micro_batch.inference_logprobs.extend([0.0] * padding_size)

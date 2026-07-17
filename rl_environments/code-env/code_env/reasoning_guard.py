@@ -116,11 +116,24 @@ def _count_words(text: str) -> int:
     return len([part for part in re.split(r"\s+", (text or "").strip()) if part])
 
 
+def _rollout_is_truncated(state: vf.State) -> bool:
+    if state.get("is_truncated"):
+        return True
+    for step in state.get("trajectory") or []:
+        if isinstance(step, dict):
+            if step.get("is_truncated"):
+                return True
+        elif getattr(step, "is_truncated", False):
+            return True
+    return False
+
+
 def reasoning_guard_breakdown(
     completion: Any,
     *,
     reasoning_required: bool = True,
     metric_prefix: str = "reasoning_zero_guard",
+    is_truncated: bool = False,
 ) -> dict[str, Any]:
     assistant_messages = _assistant_messages(completion)
     visible_texts = [_strip_think_tags(_message_content(message)) for message in assistant_messages]
@@ -132,9 +145,10 @@ def reasoning_guard_breakdown(
     zero_visible_output = visible_chars == 0
     missing_reasoning = reasoning_required and visible_chars > 0 and not reasoning_traces
     unclosed_think = any(_has_unclosed_think(_message_content(message)) for message in assistant_messages)
-    multiplier = 0.0 if (unclosed_think or zero_visible_output or missing_reasoning) else 1.0
+    multiplier = 0.0 if (is_truncated or unclosed_think or zero_visible_output or missing_reasoning) else 1.0
     return {
         f"{metric_prefix}_multiplier": multiplier,
+        f"{metric_prefix}_truncated": float(is_truncated),
         f"{metric_prefix}_unclosed_think": float(unclosed_think),
         f"{metric_prefix}_zero_visible_output": float(zero_visible_output),
         f"{metric_prefix}_missing_reasoning": float(missing_reasoning),
@@ -142,7 +156,7 @@ def reasoning_guard_breakdown(
         f"{metric_prefix}_visible_chars": float(visible_chars),
         f"{metric_prefix}_visible_words": float(visible_words),
         "final_reward_formula": (
-            "0 if unclosed_think or zero_visible_output or missing_reasoning else base_reward"
+            "0 if truncated or unclosed_think or zero_visible_output or missing_reasoning else base_reward"
         ),
     }
 
@@ -188,7 +202,12 @@ class ReasoningGuardRubric(vf.Rubric):
         )
 
     async def score_rollout(self, state: vf.State):
-        breakdown = self.guard_breakdown(state.get("completion"))
+        breakdown = reasoning_guard_breakdown(
+            state.get("completion"),
+            reasoning_required=self.reasoning_required,
+            metric_prefix=self.guard_name,
+            is_truncated=_rollout_is_truncated(state),
+        )
         state.setdefault("reward_breakdown", {})[self.guard_name] = breakdown
         numeric_metrics = {key: value for key, value in breakdown.items() if isinstance(value, int | float)}
         if breakdown[self.multiplier_key] == 0.0:

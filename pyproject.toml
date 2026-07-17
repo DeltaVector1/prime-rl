@@ -45,6 +45,7 @@ dependencies = [
     "ifeval",
     "logic-env",
     "math-env",
+    "mmlu",
     "mini-swe-agent-plus",
     "nemotron-instruction-following",
     "nemotron-knowledge",
@@ -89,6 +90,7 @@ envs = [
     "math-env",
     "math-python",
     "math500",
+    "mmlu",
     "mini-swe-agent-plus",
     "mmlu-pro",
     "opencode-cp",
@@ -229,12 +231,13 @@ general-agent = { path = "deps/research-environments/environments/general_agent"
 gpqa = { path = "deps/research-environments/environments/gpqa", editable = true }
 harnesses = { path = "deps/verifiers/packages/harnesses", editable = true }
 hle = { path = "deps/research-environments/environments/hle", editable = true }
-ifeval = { path = "rl_environments/arcee-ifeval", editable = true }
+ifeval = { path = "deps/research-environments/environments/ifeval", editable = true }
 livecodebench = { path = "deps/research-environments/environments/livecodebench", editable = true }
 logic-env = { path = "rl_environments/logic-env", editable = true }
 math-env = { path = "rl_environments/math-env", editable = true }
 math-python = { path = "deps/verifiers/environments/math_python", editable = true }
 math500 = { path = "deps/research-environments/environments/math500", editable = true }
+mmlu = { path = "rl_environments/mmlu", editable = true }
 mini-swe-agent-plus = { path = "rl_environments/mini-swe-agent-plus", editable = true }
 mmlu-pro = { path = "deps/research-environments/environments/mmlu_pro", editable = true }
 opencode-cp = { path = "deps/research-environments/environments/opencode_cp", editable = true }

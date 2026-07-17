@@ -1,0 +1,23 @@
+gpu_memory_utilization = 0.90
+api_server_count = 1
+enable_expert_parallel = true
+use_deep_gemm = true
+
+[model]
+name = "deepseek-ai/DeepSeek-V4-Flash"
+max_model_len = 65536
+enforce_eager = true
+tool_call_parser = "None"
+reasoning_parser = "None"
+
+[parallel]
+tp = 4
+dp = 1
+
+[vllm_extra]
+max_num_batched_tokens = 1024
+kv_cache_dtype = "fp8"
+linear_backend = "deep_gemm"
+
+[server]
+port = 8001

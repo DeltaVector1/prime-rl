@@ -1,0 +1,17 @@
+[project]
+name = "mmlu"
+version = "0.1.0"
+description = "Deterministic standard MMLU evaluation environment"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=4.0.0",
+    "math-verify>=0.8.0",
+    "verifiers>=0.1.15.dev17",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["mmlu.py"]

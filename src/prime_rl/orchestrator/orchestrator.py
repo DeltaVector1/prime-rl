@@ -32,7 +32,7 @@ import tomli_w
 
 if TYPE_CHECKING:
     from renderers.base import Renderer
-    from transformers.tokenization_utils import PreTrainedTokenizer
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
     from prime_rl.orchestrator.ckpt import CheckpointManager
     from prime_rl.transport.base import TrainingBatchSender
@@ -149,6 +149,7 @@ class Orchestrator:
     renderer: Renderer | None
     mm_token_type_ids_mapping: dict[int, int] | None
     teacher_inference: InferencePool | None
+    teacher_tokenizer: PreTrainedTokenizerBase | None
     heart: Heartbeat | None
     usage_reporter: UsageReporter | None
     inference_metrics: InferenceMetricsCollector | None
@@ -162,6 +163,8 @@ class Orchestrator:
     def __init__(self, config: OrchestratorConfig) -> None:
         self.config = config
         setup_logger(config.log.level, json_logging=config.log.json_logging)
+        if config.preserve_reasoning_only_responses:
+            get_logger().info("Preserving reasoning-only generations as scored token-bearing rollouts")
         # Silence in-process ``verifiers.*`` library noise but keep
         # ``verifiers.serve`` (env-server lifecycle) through our handler
         logging.getLogger("verifiers").setLevel(logging.CRITICAL + 1)
@@ -191,6 +194,7 @@ class Orchestrator:
         self.renderer = None
         self.mm_token_type_ids_mapping = None
         self.teacher_inference = None
+        self.teacher_tokenizer = None
         self.heart = None
         self.usage_reporter = None
         self.inference_metrics = None
@@ -223,6 +227,15 @@ class Orchestrator:
 
         get_logger().info(f"Initializing tokenizer ({config.tokenizer})")
         self.tokenizer = setup_tokenizer(config.tokenizer)
+        if config.training_mode == "opd":
+            assert config.teacher is not None
+            from transformers import PreTrainedTokenizerFast
+
+            self.teacher_tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                config.teacher.model.name,
+                trust_remote_code=config.teacher.model.trust_remote_code,
+            )
+            self.teacher_tokenizer.pad_token_id = self.teacher_tokenizer.eos_token_id
 
         # Student inference pool
         get_logger().info(
@@ -601,16 +614,22 @@ class Orchestrator:
         await asyncio.to_thread(save_rollouts, rollout_dicts, step_path / "train_rollouts.jsonl")
 
         teacher_logprobs_time = 0.0  # opd only
+        teacher_logprobs_metrics: dict[str, float] = {}
         if config.training_mode == "opd" and self.teacher_inference is not None:
             assert config.teacher is not None
             t = time.perf_counter()
-            teacher_logprobs_list = await compute_teacher_logprobs(
+            teacher_logprobs_batch = await compute_teacher_logprobs(
                 clients=self.teacher_inference.train_clients,
                 model_name=config.teacher.model.name,
                 samples=batch.samples,
+                student_tokenizer=self.tokenizer,
+                teacher_tokenizer=self.teacher_tokenizer,
+                recycle_server=config.teacher.recycle_after_logprobs,
+                reasoning_close_advantage=config.opd_reasoning_close_advantage,
             )
-            for ex, lp in zip(batch.samples, teacher_logprobs_list):
+            for ex, lp in zip(batch.samples, teacher_logprobs_batch.values):
                 ex.teacher_logprobs = lp
+            teacher_logprobs_metrics = teacher_logprobs_batch.metrics()
             teacher_logprobs_time = time.perf_counter() - t
 
         await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
@@ -629,6 +648,7 @@ class Orchestrator:
             pre_filter_dropped=self.train_sink.pre_filter_dropped,
             pre_filter_dropped_by_name=dict(self.train_sink.pre_filter_dropped_by_name),
         )
+        metrics.update(teacher_logprobs_metrics)
         audit_records = self.build_train_audit_records(
             batch=batch,
             audit_rollouts=audit_rollouts,
@@ -754,16 +774,15 @@ class Orchestrator:
     ) -> str | None:
         if rollout.error is not None:
             return "rollout_error"
+        if rollout.raw.get("skip_training"):
+            return "env_non_trainable"
         if in_train_batch and rollout.is_filtered:
             return "post_batch_filter"
         if in_train_batch:
             return None
-        try:
-            group_scored_partial = self.train_envs.get(rollout.env_name).requires_group_scoring and any(
-                peer.error is not None for peer in group_rollouts
-            )
-        except Exception:
-            group_scored_partial = False
+        group_scored_partial = self.train_envs.get(rollout.env_name).requires_group_scoring and any(
+            peer.error is not None for peer in group_rollouts
+        )
         if group_scored_partial:
             return "group_scored_partial_error"
         if rollout.is_filtered:
@@ -846,9 +865,7 @@ class Orchestrator:
                 }
             )
         wandb_group_mean = (
-            sum(group["reward_mean"] for group in group_summaries) / len(group_summaries)
-            if group_summaries
-            else 0.0
+            sum(group["reward_mean"] for group in group_summaries) / len(group_summaries) if group_summaries else 0.0
         )
 
         env_names = sorted(set(batch.metrics.arrivals_by_env) | {r.env_name for r in audit_rollouts})
@@ -869,7 +886,9 @@ class Orchestrator:
                 "reward_mean": (sum(reward_values) / len(reward_values)) if reward_values else 0.0,
                 "drop_counts": {
                     reason: sum(1 for _r, labels in env_entries if labels.get("drop_reason") == reason)
-                    for reason in sorted({str(labels.get("drop_reason")) for _r, labels in env_entries if labels.get("drop_reason")})
+                    for reason in sorted(
+                        {str(labels.get("drop_reason")) for _r, labels in env_entries if labels.get("drop_reason")}
+                    )
                 },
             }
 
@@ -1068,7 +1087,9 @@ class Orchestrator:
             )
         get_logger().success("\n\t\t ".join(lines))
 
-    def build_eval_audit_records(self, *, batch: EvalBatch, rollout_dicts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def build_eval_audit_records(
+        self, *, batch: EvalBatch, rollout_dicts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         created_at = self.audit_timestamp()
         reward_sum = sum(r.reward for r in batch.rollouts)
         rollout_count = len(batch.rollouts)
@@ -1085,14 +1106,20 @@ class Orchestrator:
                 "cancelled": batch.metrics.n_cancelled,
                 "errored": batch.metrics.n_errored,
                 "examples": batch.metrics.n_examples,
+                "examples_including_errors": batch.metrics.n_examples_including_errors,
                 "group_size": batch.metrics.group_size,
             },
             "reward_mean_calculation": {
-                "formula": "eval sink reward_mean over completed examples",
+                "valid_only_formula": "sum(valid rollout rewards) / valid rollout count",
+                "including_errors_formula": (
+                    "sum(non-cancelled valid rollout rewards, with errored rollouts assigned 0) "
+                    "/ non-cancelled rollout count"
+                ),
                 "rollout_reward_sum": reward_sum,
                 "rollout_count": rollout_count,
                 "rollout_mean": reward_sum / rollout_count if rollout_count else 0.0,
-                "logged_value": batch.metrics.reward_mean,
+                "valid_only_logged_value": batch.metrics.reward_mean,
+                "including_errors_logged_value": batch.metrics.reward_mean_including_errors,
             },
             "metrics": batch.metrics.to_wandb_dict(env_name=batch.env_name, step=batch.step),
         }

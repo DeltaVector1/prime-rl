@@ -168,6 +168,7 @@ def _mark_empty_model_response_zero(state: vf.State, error: vf.EmptyModelRespons
     _ensure_empty_model_response_trajectory(state, reason)
     state["error"] = None
     state["reward"] = 0.0
+    state["skip_training"] = True
     state["is_completed"] = True
     state["stop_condition"] = "empty_model_response_zero_guard"
     breakdown = {
@@ -199,6 +200,14 @@ class ZeroOnEmptyModelResponseMixin:
         state["timing"].scoring.end = time.time()
         await self.rubric.cleanup(state)
         return state
+
+    async def _run_group_states(self, group_inputs, client, model: str, sampling_args):
+        states = await super()._run_group_states(group_inputs, client, model, sampling_args)
+        for state in states:
+            error = state.get("error")
+            if _is_empty_model_response_error(error):
+                _mark_empty_model_response_zero(state, error)
+        return states
 
 
 class ZeroOnEmptyModelResponseSingleTurnEnv(ZeroOnEmptyModelResponseMixin, vf.SingleTurnEnv):
@@ -421,6 +430,7 @@ def load_environment(
     dataset_split: str = "train",
     dataset_shuffle: bool = False,
     dataset_seed: int = 42,
+    dataset_start_index: int = 0,
     question_key: str = "question",
     answer_key: str = "answer",
     info_key: str = "info",
@@ -457,6 +467,9 @@ def load_environment(
     filter_kwargs: dict = {},
     **kwargs,
 ) -> vf.Environment:
+    if dataset_start_index < 0:
+        raise ValueError("dataset_start_index must be non-negative")
+
     def build_dataset():
         ds = load_dataset(dataset_name, dataset_subset, split=dataset_split)
         if difficulty_key is not None:
@@ -471,6 +484,8 @@ def load_environment(
         ).select_columns(["question", "answer", "info"])
         if dataset_shuffle:
             ds = ds.shuffle(seed=dataset_seed)
+        if dataset_start_index:
+            ds = ds.skip(dataset_start_index)
         return ds
 
     judge_client = None

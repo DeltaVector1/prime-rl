@@ -8,6 +8,7 @@ Tool-calling environment for the clean Nemotron RL pivot blend. `dataset="all"` 
 |---|---|---|
 | `tool_use` | `nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-v1` | Explicit non-default proxy selector |
 | `tool_use_pivot` | `nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1` | Binary upstream-style next-action match; recursive tool name/argument comparison or message-vs-tool decision |
+| `tool_use_trajectory` | `nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1` | Multi-turn replay of complete recorded trajectories; exact one-call-per-turn matching, recorded tool outputs, and a final assistant response |
 | `function_calling` | `nvidia/Nemotron-RL-Agentic-Function-Calling-Pivot-v1` | Binary upstream-style next-action match; recursive tool name/argument comparison or message-vs-tool decision |
 | `workplace` | `nvidia/Nemotron-RL-agent-workplace_assistant` | Explicit proxy selector; deterministic sequence match against ground-truth call list |
 | `indirect_prompt_injection` | `nvidia/Nemotron-RL-Agentic-Indirect-Prompt-Injection-v1` | Explicit proxy selector; penalizes target-tool execution and rewards benign required tool calls |
@@ -18,6 +19,8 @@ Use `dataset="all"` for `tool_use_pivot,function_calling,swe_pivot` or pass a co
 ## Tool-call Parsing
 
 Prompt normalization converts OpenAI Responses-style dataset transcripts into native chat messages. Historical `function_call` records become assistant `tool_calls`, historical `function_call_output` records become `tool` messages, and source tool schemas are exposed through runtime `tool_defs` by default. Each pivot row is an upstream single-step behavior-cloning example: the model predicts exactly the next assistant message or tool call from the full historical transcript. The env therefore does not fabricate a tool result or score an additional assistant turn that has no target in the dataset.
+
+`tool_use_trajectory` groups those pivots by source trajectory and runs them as a real multi-turn interaction. Each assistant turn must emit exactly the next recorded call with an exact tool name and argument structure. The environment then returns the recorded tool output from the following pivot. Bundling later calls into the same assistant turn is incorrect and receives no action credit. An incorrect action gets one feedback turn and one retry so later actions remain reachable, but a retry cannot restore strict credit for that action. The trajectory only passes when every tool action and the recorded final assistant response are correct on the first attempt.
 
 The public pivot repositories expose train JSONL files only. Eval rows are held out from the loaded train artifact by source trajectory, or by SWE instance when available, so a trajectory cannot appear in both splits.
 
@@ -97,9 +100,9 @@ VLLM_API_KEY=dummy prime eval run nemotron-tool-calling \
 
 | Name | Default | Description |
 |---|---|---|
-| `dataset` | `all` | `all` (`tool_use_pivot,function_calling,swe_pivot`), `tool_use`, `tool_use_pivot`, `function_calling`, `workplace`, `indirect_prompt_injection`, `swe_pivot`, or comma-separated subset |
+| `dataset` | `all` | `all` (`tool_use_pivot,function_calling,swe_pivot`), `tool_use`, `tool_use_pivot`, `tool_use_trajectory`, `function_calling`, `workplace`, `indirect_prompt_injection`, `swe_pivot`, or comma-separated subset |
 | `num_train_examples` | `-1` | Number of shuffled train rows; `-1` uses all available rows |
-| `num_eval_examples` | `256` | Number of source-disjoint held-out eval rows |
+| `num_eval_examples` | `256` | Number of source-group- and exact-prompt-disjoint held-out eval rows |
 | `dataset_seed` | `42` | Dataset sampling and shuffle seed |
 | `system_prompt` | `None` | Optional system message merged into dataset system prompts |
 | `judge_model` | `google/gemma-4-26B-A4B-it` | Model name sent to the local judge endpoint |
@@ -123,4 +126,4 @@ VLLM_API_KEY=dummy prime eval run nemotron-tool-calling \
 
 ## Metrics
 
-Task metrics include `action_match`, `workplace_action_match`, `ipi_resistance`, `ipi_target_tool_called`, `emitted_tool_call`, and `tool_call_shape`. The guard wrapper adds `anti_hacking_*` metrics for truncation, missing reasoning, renderer-stripped native tool calls, zero-visible-output, unclosed reasoning tags, coherency, meta-commentary, `anti_hacking_reasoning_words`, `anti_hacking_reasoning_quality`, `anti_hacking_format_reward`, `task_reward`, and the final guard multiplier.
+Task metrics include `action_match`, `workplace_action_match`, `ipi_resistance`, `ipi_target_tool_called`, `emitted_tool_call`, and `tool_call_shape`. The trajectory env additionally reports `recorded_sequence_pass`, `recorded_action_fraction`, `recorded_environment_turns`, and `recorded_failed_attempts`. The guard wrapper adds `anti_hacking_*` metrics for truncation, missing reasoning, renderer-stripped native tool calls, zero-visible-output, unclosed reasoning tags, coherency, meta-commentary, `anti_hacking_reasoning_words`, `anti_hacking_reasoning_quality`, `anti_hacking_format_reward`, `task_reward`, and the final guard multiplier.

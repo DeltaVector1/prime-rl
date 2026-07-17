@@ -15,7 +15,6 @@ import asyncio
 import contextlib
 import json
 import os
-import random
 import re
 import sys
 from typing import Any
@@ -23,121 +22,29 @@ from typing import Any
 import reasoning_gym
 import verifiers as vf
 from datasets import Dataset
-from huggingface_hub import hf_hub_download
 from nemotron_reasoning_guardrails import (
-    AntiHackingConfig,
-    compose_system_prompt,
+    coerce,
+    extract_completion_text,
+    extract_final_answer,
+    extract_tool_defs,
+    format_prompt_for_judge,
     guard_env,
+    judge_equivalence,
+    load_jsonl,
+    make_disjoint_dataset_builders,
+    make_guard_config,
     merge_system_prompt,
+    message_role,
+    message_tool_calls,
+    normalize_answer,
+    openai_client,
     parse_bool,
 )
-from openai import AsyncOpenAI
 
-
-class _RoundRobinChatCompletions:
-    def __init__(self, clients: list[AsyncOpenAI]):
-        self._clients = clients
-        self._index = 0
-
-    async def create(self, *args: Any, **kwargs: Any) -> Any:
-        client = self._clients[self._index % len(self._clients)]
-        self._index += 1
-        return await client.chat.completions.create(*args, **kwargs)
-
-
-class _RoundRobinChat:
-    def __init__(self, clients: list[AsyncOpenAI]):
-        self.completions = _RoundRobinChatCompletions(clients)
-
-
-class _RoundRobinOpenAI:
-    def __init__(self, clients: list[AsyncOpenAI]):
-        self.chat = _RoundRobinChat(clients)
-
-
-def _normalize_base_urls(base_url: Any) -> list[str]:
-    if base_url is None:
-        return []
-    if isinstance(base_url, str):
-        value = base_url.strip()
-        if value.startswith("["):
-            try:
-                parsed = ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                parsed = value
-            raw_urls = parsed if isinstance(parsed, (list, tuple)) else [parsed]
-        else:
-            raw_urls = [value]
-    elif isinstance(base_url, (list, tuple)):
-        raw_urls = base_url
-    else:
-        raw_urls = [base_url]
-
-    urls: list[str] = []
-    for raw_url in raw_urls:
-        if raw_url is None:
-            continue
-        url = str(raw_url).strip().rstrip("/")
-        if not url:
-            continue
-        if not url.endswith("/v1"):
-            url = f"{url}/v1"
-        urls.append(url)
-    return urls
-
-
-def _openai_client(api_key: str, base_url: Any, http_client: Any = None) -> Any:
-    urls = _normalize_base_urls(base_url)
-    if len(urls) <= 1:
-        return AsyncOpenAI(api_key=api_key, base_url=urls[0] if urls else base_url, http_client=http_client)
-    clients = [AsyncOpenAI(api_key=api_key, base_url=url, http_client=http_client) for url in urls]
-    return _RoundRobinOpenAI(clients)
-
-
-RG_DATASET = "nvidia/Nemotron-RL-ReasoningGym-v1"
-MATH_DATASET = "nvidia/Nemotron-RL-Math-v2"
-SCIENCE_DATASET = "nvidia/Nemotron-RL-Science-v1"
-ARC_AGI_DATASET = "nvidia/Nemotron-RL-ARC-AGI-v1"
 PYTHON_TOOL_NAME = "stateful_python_code_exec"
 PYTHON_TOOL_OUTPUT_LIMIT = 8000
 
-ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
-ANSWER_LINE_RE = re.compile(r"^\s*(?:final\s+)?answer\s*[:=]\s*(.+?)\s*$", re.IGNORECASE)
-BOXED_RE = re.compile(r"\\boxed\{(.*?)\}", re.DOTALL)
 JSON_GRID_RE = re.compile(r"(\[\s*\[.*?\]\s*\])", re.DOTALL)
-
-SCORE_TAG_RE = re.compile(r"<score>\s*([01])\s*</score>|<score>\s*([01])", re.IGNORECASE)
-
-EQUIVALENCE_PROMPT = """You are grading final-answer equivalence.
-
-Task:
-{question}
-
-Reference answer:
-{expected}
-
-Candidate answer:
-{candidate}
-
-Score 1 if the candidate final answer is mathematically, scientifically, or factually equivalent to the reference answer. Score 0 otherwise. Ignore formatting differences, but do not give credit for unsupported guesses or answers that only partially overlap.
-
-Output exactly:
-<score>0</score> or <score>1</score>
-"""
-
-
-def _coerce(value: Any) -> Any:
-    if value is None or isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except Exception:
-            try:
-                return ast.literal_eval(value)
-            except Exception:
-                return value
-    return value
 
 
 def _input_to_prompt(
@@ -145,7 +52,7 @@ def _input_to_prompt(
     fallback_question: str | None = None,
     system_prompt: str | None = None,
 ) -> list[dict[str, str]]:
-    payload = _coerce(payload)
+    payload = coerce(payload)
     items = payload.get("input") if isinstance(payload, dict) else payload
     if isinstance(items, list):
         messages: list[dict[str, str]] = []
@@ -170,95 +77,14 @@ def _input_to_prompt(
     return []
 
 
-def _normalize_tool_def(raw_tool: Any) -> dict[str, Any] | None:
-    raw_tool = _coerce(raw_tool)
-    if not isinstance(raw_tool, dict):
-        return None
-    spec = raw_tool.get("function") if isinstance(raw_tool.get("function"), dict) else raw_tool
-    name = str(spec.get("name") or "").strip()
-    if not name:
-        return None
-    parameters = spec.get("parameters")
-    if isinstance(parameters, str):
-        try:
-            parameters = json.loads(parameters)
-        except Exception:
-            parameters = {}
-    if not isinstance(parameters, dict):
-        parameters = {"type": "object", "properties": {}}
-    tool: dict[str, Any] = {
-        "name": name,
-        "description": str(spec.get("description") or ""),
-        "parameters": parameters,
-    }
-    strict = spec.get("strict", raw_tool.get("strict"))
-    if strict is not None:
-        tool["strict"] = bool(strict)
-    return tool
-
-
-def _extract_tool_defs(payload: Any) -> list[dict[str, Any]]:
-    payload = _coerce(payload)
-    tools = payload.get("tools") if isinstance(payload, dict) else None
-    if not isinstance(tools, list):
-        return []
-    normalized = [_normalize_tool_def(tool) for tool in tools]
-    return [tool for tool in normalized if tool is not None]
-
-
-def _load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[dict[str, Any]]:
-    path = hf_hub_download(repo, filename, repo_type="dataset")
-    rows: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    rng = random.Random(seed)
-    rng.shuffle(rows)
-    if num_examples > 0:
-        rows = rows[:num_examples]
-    return rows
-
-
-def _completion_text(completion: Any) -> str:
-    if isinstance(completion, str):
-        return completion
-    if isinstance(completion, list):
-        for message in reversed(completion):
-            role = str(message.get("role", "") if isinstance(message, dict) else getattr(message, "role", "")).lower()
-            if role == "assistant":
-                return str((message.get("content") if isinstance(message, dict) else getattr(message, "content", "")) or "")
-        for message in reversed(completion):
-            content = str((message.get("content") if isinstance(message, dict) else getattr(message, "content", "")) or "")
-            if content:
-                return content
-    return ""
-
-
-def _message_role(message: Any) -> str:
-    if isinstance(message, dict):
-        return str(message.get("role", "")).lower()
-    return str(getattr(message, "role", "")).lower()
-
-
 def _object_get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
 
 
-def _message_tool_calls(message: Any) -> list[Any]:
-    calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
-    return calls if isinstance(calls, list) else []
-
-
 def _normalize_tool_args(args: Any) -> Any:
-    args = _coerce(args)
+    args = coerce(args)
     if isinstance(args, str):
         try:
             return json.loads(args)
@@ -268,7 +94,7 @@ def _normalize_tool_args(args: Any) -> Any:
 
 
 def _tool_call_parts(tool_call: Any, index: int = 0) -> tuple[str, str, Any]:
-    tool_call = _coerce(tool_call)
+    tool_call = coerce(tool_call)
     if hasattr(tool_call, "model_dump"):
         try:
             tool_call = tool_call.model_dump()
@@ -296,132 +122,13 @@ def _completion_tool_calls(completion: Any) -> list[dict[str, Any]]:
         return []
     calls: list[dict[str, Any]] = []
     for message in completion:
-        if _message_role(message) != "assistant":
+        if message_role(message) != "assistant":
             continue
-        for idx, tool_call in enumerate(_message_tool_calls(message)):
+        for idx, tool_call in enumerate(message_tool_calls(message)):
             call_id, name, arguments = _tool_call_parts(tool_call, idx)
             if name:
                 calls.append({"id": call_id, "name": name, "arguments": arguments})
     return calls
-
-
-def _last_boxed_content(text: str) -> str | None:
-    starts = [m.start() for m in re.finditer(r"\\boxed\s*\{", text or "")]
-    for start in reversed(starts):
-        open_idx = text.find("{", start)
-        if open_idx < 0:
-            continue
-        depth = 0
-        for idx in range(open_idx, len(text)):
-            char = text[idx]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[open_idx + 1:idx].strip()
-    return None
-
-
-def _extract_final_answer(text: str) -> str:
-    if not text:
-        return ""
-    answer_matches = list(ANSWER_TAG_RE.finditer(text))
-    if answer_matches:
-        return answer_matches[-1].group(1).strip()
-    boxed = _last_boxed_content(text)
-    if boxed is not None:
-        return boxed
-    for line in reversed(text.splitlines()):
-        answer_line = ANSWER_LINE_RE.match(line)
-        if answer_line:
-            return answer_line.group(1).strip()
-    return text.strip()
-
-
-def _normalize_answer(text: Any) -> str:
-    value = str(text or "").strip()
-    value = re.sub(r"\\\[(.*?)\\\]", r"\1", value, flags=re.DOTALL)
-    value = re.sub(r"\\\((.*?)\\\)", r"\1", value, flags=re.DOTALL)
-    value = value.replace("$", "")
-    value = re.sub(r"\\boxed\{(.*?)\}", r"\1", value, flags=re.DOTALL)
-    value = re.sub(r"\s+", " ", value).strip().lower()
-    value = value.strip(" .,:;`'\"")
-    return value
-
-
-async def _judge_equivalence(
-    judge_client: AsyncOpenAI | None,
-    judge_model: str,
-    judge_sampling_args: dict[str, Any] | None,
-    question: str,
-    expected: str,
-    candidate: str,
-    state: vf.State | None = None,
-) -> float:
-    if _normalize_answer(candidate) == _normalize_answer(expected):
-        return 1.0
-    if judge_client is None:
-        return 0.0
-    sampling = {k: v for k, v in (judge_sampling_args or {}).items() if v is not None}
-    sampling.setdefault("temperature", 0.0)
-    sampling.setdefault("max_tokens", 32)
-    prompt = EQUIVALENCE_PROMPT.format(question=question[-4000:], expected=expected, candidate=candidate)
-    try:
-        response = await judge_client.chat.completions.create(
-            model=judge_model,
-            messages=[{"role": "user", "content": prompt}],
-            **sampling,
-        )
-    except Exception as exc:
-        if state is not None:
-            logs = state.setdefault("judge_logs", [])
-            if isinstance(logs, list):
-                logs.append(
-                    {
-                        "kind": "nemotron_reasoning.equivalence",
-                        "model": judge_model,
-                        "prompt": prompt,
-                        "response": None,
-                        "error": repr(exc),
-                    }
-                )
-        return 0.0
-    verdict = str(response.choices[0].message.content or "")
-    values = [
-        match.group(1) or match.group(2)
-        for match in SCORE_TAG_RE.finditer(verdict)
-        if (match.group(1) or match.group(2)) in {"0", "1"}
-    ]
-    parsed_score = 0.0 if not values or len(set(values)) > 1 else (1.0 if values[-1] == "1" else 0.0)
-    if state is not None:
-        logs = state.setdefault("judge_logs", [])
-        if isinstance(logs, list):
-            logs.append(
-                {
-                    "kind": "nemotron_reasoning.equivalence",
-                    "model": judge_model,
-                    "prompt": prompt,
-                    "response": verdict,
-                    "error": None,
-                    "parsed_score": parsed_score,
-                }
-            )
-    if not values or len(set(values)) > 1:
-        return 0.0
-    return 1.0 if values[-1] == "1" else 0.0
-
-
-def _prompt_text(prompt: Any) -> str:
-    if not isinstance(prompt, list):
-        return str(prompt)
-    parts: list[str] = []
-    for msg in prompt:
-        role = str(msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")).upper()
-        content = str((msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")) or "")
-        if role:
-            parts.append(f"{role}: {content}")
-    return "\n\n".join(parts)
 
 
 def _use_boxed_format(row_index: int, seed: int) -> bool:
@@ -472,13 +179,18 @@ def _rewrite_final_answer_prompt(prompt: list[dict[str, str]], boxed: bool) -> l
         return messages
     content = _strip_final_answer_format_instruction(_message_content(messages[user_idx]))
     if boxed:
-        instruction = "Put your final answer on the last line as `Answer: \\\\boxed{X}`."
+        instruction = "Put your final answer on the last line as `Answer: \\boxed{X}`."
     else:
         instruction = "Put your final answer on the last line as `Answer: X`."
     messages[user_idx] = _set_message_content(messages[user_idx], f"{content}\n\n{instruction}".strip())
     return messages
 
 
+# Runs model-authored code in a fresh `python -I` subprocess. The builtins
+# allowlist below raises the cost of casual mischief but is NOT a security
+# boundary: restricted-exec Python is escapable (e.g. via __subclasses__), and
+# numpy/sympy can reach the filesystem anyway. It relies on the training host
+# being trusted. Put it behind a real sandbox before running untrusted policies.
 PYTHON_TOOL_RUNNER = r"""
 import ast
 import contextlib
@@ -618,12 +330,14 @@ async def _run_python_tool(code: str, state: vf.State, timeout: float) -> str:
     except Exception as exc:
         return f"Error: Python execution failed to start: {type(exc).__name__}: {exc}"
 
-    if stderr:
-        return f"Error: Python tool runner wrote to stderr:\n{stderr.decode(errors='replace')[:PYTHON_TOOL_OUTPUT_LIMIT]}"
+    # stderr alone is not a failure: numpy and sympy routinely warn there on a
+    # perfectly good run. Only the runner's JSON verdict on stdout decides, and
+    # stderr is surfaced solely when that verdict is missing or unreadable.
     try:
         result = json.loads(stdout.decode(errors="replace"))
     except Exception:
-        return f"Error: Python tool runner returned invalid output:\n{stdout.decode(errors='replace')[:PYTHON_TOOL_OUTPUT_LIMIT]}"
+        details = stdout.decode(errors="replace").strip() or stderr.decode(errors="replace").strip()
+        return f"Error: Python tool runner returned invalid output:\n{details}"[:PYTHON_TOOL_OUTPUT_LIMIT]
     if result.get("error"):
         output = str(result.get("stdout") or "").strip()
         error = str(result.get("error") or "unknown error")
@@ -671,13 +385,13 @@ class PythonToolAnswerEnv(vf.MultiTurnEnv):
         if not completion:
             return False
         last_message = completion[-1]
-        return _message_role(last_message) == "assistant" and not _message_tool_calls(last_message)
+        return message_role(last_message) == "assistant" and not message_tool_calls(last_message)
 
     async def env_response(self, messages: vf.Messages, state: vf.State, **_kwargs) -> vf.Messages:
         if not messages:
             return []
         tool_messages: list[vf.ToolMessage] = []
-        for idx, tool_call in enumerate(_message_tool_calls(messages[-1])):
+        for idx, tool_call in enumerate(message_tool_calls(messages[-1])):
             tool_call_id, tool_name, tool_args = _tool_call_parts(tool_call, idx)
             if tool_name != PYTHON_TOOL_NAME:
                 content = f"Error: unknown tool {tool_name!r}."
@@ -711,7 +425,7 @@ def _resolve_rg_score_fn(source_dataset: str):
 
 
 async def reasoning_gym_score(completion, answer, info, **_kwargs) -> float:
-    model_answer = _extract_final_answer(_completion_text(completion))
+    model_answer = extract_final_answer(extract_completion_text(completion))
     source_dataset = (info or {}).get("source_dataset", "")
     score_fn = _resolve_rg_score_fn(source_dataset)
     if score_fn is not None:
@@ -723,16 +437,16 @@ async def reasoning_gym_score(completion, answer, info, **_kwargs) -> float:
             return float(score_fn(answer=model_answer, entry={"answer": answer, "metadata": entry_metadata}))
         except Exception:
             pass
-    return 1.0 if _normalize_answer(model_answer) == _normalize_answer(answer) else 0.0
+    return 1.0 if normalize_answer(model_answer) == normalize_answer(answer) else 0.0
 
 
 def _build_reasoning_gym(num_examples: int, seed: int, system_prompt: str | None) -> Dataset:
-    raw = _load_jsonl(RG_DATASET, "data/train.jsonl", num_examples, seed)
+    raw = load_jsonl("nvidia/Nemotron-RL-ReasoningGym-v1", "data/train.jsonl", num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
         prompt = _input_to_prompt(row.get("input"), row.get("question"), system_prompt)
         answer = str(row.get("answer", "")).strip()
-        metadata = _coerce(row.get("metadata"))
+        metadata = coerce(row.get("metadata"))
         if not prompt or not answer:
             continue
         if not isinstance(metadata, dict):
@@ -752,10 +466,17 @@ def _build_reasoning_gym(num_examples: int, seed: int, system_prompt: str | None
     return Dataset.from_list(rows)
 
 
-def _reasoning_gym_env(num_train_examples: int, num_eval_examples: int, dataset_seed: int, system_prompt: str | None) -> vf.Environment:
+def _reasoning_gym_env(
+    num_train_examples: int, num_eval_examples: int, dataset_seed: int, system_prompt: str | None
+) -> vf.Environment:
+    train_dataset, eval_dataset = make_disjoint_dataset_builders(
+        lambda num_examples: _build_reasoning_gym(num_examples, dataset_seed, system_prompt),
+        num_train_examples,
+        num_eval_examples,
+    )
     return vf.SingleTurnEnv(
-        dataset=lambda: _build_reasoning_gym(num_train_examples, dataset_seed, system_prompt),
-        eval_dataset=lambda: _build_reasoning_gym(num_eval_examples, dataset_seed + 1, system_prompt),
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
         rubric=vf.Rubric(funcs=[reasoning_gym_score]),
         system_prompt=system_prompt,
     )
@@ -772,7 +493,7 @@ def _build_expected_answer_rows(
     seed: int,
     system_prompt: str | None,
 ) -> Dataset:
-    raw = _load_jsonl(repo, filename, -1, seed)
+    raw = load_jsonl(repo, filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
         responses_create_params = row.get("responses_create_params")
@@ -787,7 +508,7 @@ def _build_expected_answer_rows(
         boxed = _use_boxed_format(len(rows), seed) if subtask in {"math", "science"} else True
         if subtask in {"math", "science"}:
             prompt = _rewrite_final_answer_prompt(prompt, boxed)
-        metadata = _coerce(row.get("metadata"))
+        metadata = coerce(row.get("metadata"))
         if not isinstance(metadata, dict):
             metadata = {}
         rows.append(
@@ -800,12 +521,10 @@ def _build_expected_answer_rows(
                     "metadata_json": json.dumps(metadata, default=str),
                     "subtask": subtask,
                     "answer_format": "boxed" if boxed else "answer_line",
-                    "tool_defs_json": json.dumps(_extract_tool_defs(responses_create_params), ensure_ascii=False),
+                    "tool_defs_json": json.dumps(extract_tool_defs(responses_create_params), ensure_ascii=False),
                 },
             }
         )
-        if num_examples > 0 and len(rows) >= num_examples:
-            break
     return Dataset.from_list(rows)
 
 
@@ -825,15 +544,16 @@ def _expected_answer_env(
     python_tool_max_turns: int = 3,
 ) -> vf.Environment:
     async def answer_score(prompt, completion, answer, state=None, **_kwargs) -> float:
-        candidate = _extract_final_answer(_completion_text(completion))
-        return await _judge_equivalence(
+        candidate = extract_final_answer(extract_completion_text(completion))
+        return await judge_equivalence(
             judge_client,
             judge_model,
             judge_sampling_args,
-            _prompt_text(prompt),
+            format_prompt_for_judge(prompt),
             str(answer),
             candidate,
             state,
+            kind=f"nemotron_reasoning.{subtask}.equivalence",
         )
 
     async def python_tool_call_emitted(completion, **_kwargs) -> float:
@@ -851,9 +571,16 @@ def _expected_answer_env(
         env_cls = vf.SingleTurnEnv
         env_kwargs = {}
 
+    train_dataset, eval_dataset = make_disjoint_dataset_builders(
+        lambda num_examples: _build_expected_answer_rows(
+            repo, filename, subtask, num_examples, dataset_seed, system_prompt
+        ),
+        num_train_examples,
+        num_eval_examples,
+    )
     return env_cls(
-        dataset=lambda: _build_expected_answer_rows(repo, filename, subtask, num_train_examples, dataset_seed, system_prompt),
-        eval_dataset=lambda: _build_expected_answer_rows(repo, filename, subtask, num_eval_examples, dataset_seed + 1, system_prompt),
+        dataset=train_dataset,
+        eval_dataset=eval_dataset,
         rubric=rubric,
         system_prompt=system_prompt,
         **env_kwargs,
@@ -864,7 +591,7 @@ def _expected_answer_env(
 
 
 def _parse_grid(text: str) -> list[list[int]] | None:
-    candidate = _extract_final_answer(text)
+    candidate = extract_final_answer(text)
     match = JSON_GRID_RE.search(candidate)
     if match:
         try:
@@ -899,7 +626,7 @@ def _is_grid(value: Any) -> bool:
 
 
 async def arc_grid_score(completion, answer, **_kwargs) -> float:
-    predicted = _parse_grid(_completion_text(completion))
+    predicted = _parse_grid(extract_completion_text(completion))
     try:
         expected = json.loads(answer)
     except Exception:
@@ -908,7 +635,7 @@ async def arc_grid_score(completion, answer, **_kwargs) -> float:
 
 
 def _build_arc_transductive(filename: str, num_examples: int, seed: int, system_prompt: str | None) -> Dataset:
-    raw = _load_jsonl(ARC_AGI_DATASET, filename, num_examples, seed)
+    raw = load_jsonl("nvidia/Nemotron-RL-ARC-AGI-v1", filename, num_examples, seed)
     rows: list[dict[str, Any]] = []
     for row in raw:
         prompt = _input_to_prompt(row.get("responses_create_params"), system_prompt=system_prompt)
@@ -930,10 +657,17 @@ def _build_arc_transductive(filename: str, num_examples: int, seed: int, system_
     return Dataset.from_list(rows)
 
 
-def _arc_agi_env(num_train_examples: int, num_eval_examples: int, dataset_seed: int, system_prompt: str | None) -> vf.Environment:
+def _arc_agi_env(
+    num_train_examples: int, num_eval_examples: int, dataset_seed: int, system_prompt: str | None
+) -> vf.Environment:
+    # ARC ships its own train/validation files, so no disjoint split is needed.
     return vf.SingleTurnEnv(
-        dataset=lambda: _build_arc_transductive("data/transductive/train.jsonl", num_train_examples, dataset_seed, system_prompt),
-        eval_dataset=lambda: _build_arc_transductive("data/transductive/validation.jsonl", num_eval_examples, dataset_seed + 1, system_prompt),
+        dataset=lambda: _build_arc_transductive(
+            "data/transductive/train.jsonl", num_train_examples, dataset_seed, system_prompt
+        ),
+        eval_dataset=lambda: _build_arc_transductive(
+            "data/transductive/validation.jsonl", num_eval_examples, dataset_seed + 1, system_prompt
+        ),
         rubric=vf.Rubric(funcs=[arc_grid_score]),
         system_prompt=system_prompt,
     )
@@ -941,11 +675,6 @@ def _arc_agi_env(num_train_examples: int, num_eval_examples: int, dataset_seed: 
 
 # --- Composer --------------------------------------------------------------
 
-
-_LOADERS = {
-    "reasoning_gym": _reasoning_gym_env,
-    "arc_agi": _arc_agi_env,
-}
 
 _ALIASES = {
     "reasoning-gym": "reasoning_gym",
@@ -983,19 +712,11 @@ def load_environment(
     judge_base_url: str | None = "http://127.0.0.1:8000/v1",
     judge_api_key_var: str = "VLLM_API_KEY",
     judge_sampling_args: dict | None = None,
-    enable_task_judges: bool = True,
     enable_anti_hacking: bool = True,
     enable_anti_hacking_judges: bool = True,
-    anti_hacking_judge_model: str | None = None,
-    anti_hacking_judge_base_url: str | None = None,
-    anti_hacking_judge_api_key_var: str | None = None,
-    anti_hacking_judge_timeout: float = 120.0,
-    anti_hacking_incoherent_multiplier: float = 0.1,
-    anti_hacking_meta_multiplier: float = 0.01,
-    anti_hacking_reasoning_required: bool = True,
-    anti_hacking_output_prompt: str | None = None,
+    anti_hacking_reasoning_required: bool = False,
+    anti_hacking_allow_renderer_stripped_tool_calls: bool = False,
     anti_hacking_format_reward_weight: float = 0.1,
-    enable_structured_marker_gate: bool = False,
     enable_native_python_tools: bool = True,
     python_tool_timeout: float = 10.0,
     python_tool_max_turns: int = 3,
@@ -1003,81 +724,24 @@ def load_environment(
 ) -> vf.Environment:
     """Load a Nemotron reasoning env or a comma-separated subset."""
     keys = _resolve_datasets(dataset)
-    enable_task_judges = parse_bool(enable_task_judges)
-    enable_anti_hacking = parse_bool(enable_anti_hacking)
-    enable_anti_hacking_judges = parse_bool(enable_anti_hacking_judges)
-    anti_hacking_reasoning_required = parse_bool(anti_hacking_reasoning_required)
-    enable_structured_marker_gate = parse_bool(enable_structured_marker_gate)
     enable_native_python_tools = parse_bool(enable_native_python_tools)
-    if enable_anti_hacking:
-        system_prompt = compose_system_prompt(system_prompt, anti_hacking_output_prompt)
-
-    needs_task_judge = enable_task_judges and any(key in _JUDGE_DATASETS for key in keys)
-    needs_guard_judge = enable_anti_hacking and enable_anti_hacking_judges
-    judge_client = None
-    if needs_task_judge or needs_guard_judge:
-        judge_client = _openai_client(api_key=os.environ.get(judge_api_key_var, "dummy-key"), base_url=judge_base_url)
-
-    guard_config = None
-    if enable_anti_hacking:
-        guard_client = judge_client
-        guard_model = anti_hacking_judge_model or judge_model
-        guard_base_url = anti_hacking_judge_base_url or judge_base_url
-        guard_key_var = anti_hacking_judge_api_key_var or judge_api_key_var
-        if enable_anti_hacking_judges and (
-            guard_client is None or guard_model != judge_model or guard_base_url != judge_base_url
-        ):
-            guard_client = _openai_client(api_key=os.environ.get(guard_key_var, "dummy-key"), base_url=guard_base_url)
-        guard_config = AntiHackingConfig(
-            judge_client=guard_client if enable_anti_hacking_judges else None,
-            judge_model=guard_model,
-            judge_sampling_args=judge_sampling_args or {"temperature": 0.0, "max_tokens": 96},
-            judge_timeout=float(anti_hacking_judge_timeout),
-            enable_judges=enable_anti_hacking_judges,
-            reasoning_required=anti_hacking_reasoning_required,
-            enable_structured_marker_gate=enable_structured_marker_gate,
-            format_reward_weight=float(anti_hacking_format_reward_weight),
-            incoherent_penalty_multiplier=float(anti_hacking_incoherent_multiplier),
-            meta_commentary_multiplier=float(anti_hacking_meta_multiplier),
-        )
-
-    judge_args = (
-        judge_client if needs_task_judge else None,
-        judge_model,
-        judge_sampling_args,
-        num_train_examples,
-        num_eval_examples,
-        dataset_seed,
-        system_prompt,
+    needs_judge = any(key in _JUDGE_DATASETS for key in keys) or (
+        parse_bool(enable_anti_hacking) and parse_bool(enable_anti_hacking_judges)
     )
+    judge_client = openai_client(os.environ.get(judge_api_key_var, "dummy-key"), judge_base_url) if needs_judge else None
+    guard_config = make_guard_config(
+        enable_anti_hacking, enable_anti_hacking_judges, judge_client, judge_model, judge_sampling_args,
+        anti_hacking_reasoning_required, anti_hacking_allow_renderer_stripped_tool_calls, anti_hacking_format_reward_weight,
+    )
+
+    judge_args = (judge_client, judge_model, judge_sampling_args, num_train_examples, num_eval_examples, dataset_seed, system_prompt)
+    python_tool = (enable_native_python_tools, float(python_tool_timeout), int(python_tool_max_turns))
     builders = {
         "reasoning_gym": lambda: _reasoning_gym_env(num_train_examples, num_eval_examples, dataset_seed, system_prompt),
-        "math": lambda: _expected_answer_env(
-            MATH_DATASET,
-            "data/train.jsonl",
-            "math",
-            *judge_args,
-            enable_native_python_tools,
-            float(python_tool_timeout),
-            int(python_tool_max_turns),
-        ),
-        "science": lambda: _expected_answer_env(
-            SCIENCE_DATASET,
-            "so_openq.jsonl",
-            "science",
-            *judge_args,
-            enable_native_python_tools,
-            float(python_tool_timeout),
-            int(python_tool_max_turns),
-        ),
+        "math": lambda: _expected_answer_env("nvidia/Nemotron-RL-Math-v2", "data/train.jsonl", "math", *judge_args, *python_tool),
+        "science": lambda: _expected_answer_env("nvidia/Nemotron-RL-Science-v1", "so_openq.jsonl", "science", *judge_args, *python_tool),
         "arc_agi": lambda: _arc_agi_env(num_train_examples, num_eval_examples, dataset_seed, system_prompt),
     }
-
-    envs: list[vf.Environment] = []
-    names: list[str] = []
-    for key in keys:
-        envs.append(guard_env(builders[key](), guard_config))
-        names.append(f"nemotron-reasoning-{key.replace('_', '-')}")
-    if len(envs) == 1:
-        return envs[0]
-    return vf.EnvGroup(envs=envs, env_names=names)
+    envs = [guard_env(builders[key](), guard_config) for key in keys]
+    names = [f"nemotron-reasoning-{key.replace('_', '-')}" for key in keys]
+    return envs[0] if len(envs) == 1 else vf.EnvGroup(envs=envs, env_names=names)

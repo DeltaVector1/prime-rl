@@ -181,6 +181,20 @@ class MultiPacker(BasePacker):
                 False,
                 f"Run wrote a sample with completion temperatures length != completion ids length ({len(sample.completion_temperatures)} != {len(sample.completion_ids)})",
             )
+        if sample.completion_environment_mask is not None and len(sample.completion_environment_mask) != len(
+            sample.completion_ids
+        ):
+            return (
+                False,
+                "Run wrote a sample with environment mask length != completion ids length "
+                f"({len(sample.completion_environment_mask)} != {len(sample.completion_ids)})",
+            )
+        if sample.prompt_environment_mask is not None and len(sample.prompt_environment_mask) != len(sample.prompt_ids):
+            return (
+                False,
+                "Prompt environment mask length does not match prompt IDs "
+                f"({len(sample.prompt_environment_mask)} != {len(sample.prompt_ids)})",
+            )
         if sample_length == 0:
             return False, "Run wrote a sample with no tokens"
         if sample_length > self.seq_len:

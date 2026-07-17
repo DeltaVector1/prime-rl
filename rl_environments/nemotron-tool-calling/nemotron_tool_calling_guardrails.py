@@ -1,26 +1,48 @@
+"""Shared support module for the four ``nemotron-*`` category envs.
+
+Holds the anti-hacking guardrails plus the plumbing every category env needs:
+OpenAI client construction, JSONL loading, answer extraction, judge helpers and
+disjoint train/eval splitting.
+
+This file is kept **byte-identical** across all four envs and is only copied
+under a different name in each one (``nemotron_<category>_guardrails.py``), so
+that each env stays self-contained and independently publishable. Any change
+here must be copied to the other three. Per-env behaviour belongs in
+``AntiHackingConfig`` flags, never in a local edit to one copy.
+"""
+
 from __future__ import annotations
 
+import ast
 import asyncio
 import copy
 import json
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 import verifiers as vf
+from datasets import Dataset
+from huggingface_hub import hf_hub_download
 from openai import AsyncOpenAI
 from verifiers.utils.message_utils import sanitize_tool_calls, serialize_messages_for_output
 
-COHERENCY_JUDGE_PROMPT = """You are evaluating whether every assistant turn in a conversation is coherent and complete.
+COHERENCY_JUDGE_PROMPT = """You are checking whether the visible assistant text in a conversation is well-formed, readable language. Judge fluency and completeness ONLY.
 
-Only judge whether the visible assistant text is well-formed language and not garbled, truncated, repetitive, or nonsensical. Do not judge task correctness, safety policy, tool-choice accuracy, or compliance with output formats. Ignore missing <think> tags or other hidden-reasoning markers; reasoning traces may be removed before this check. A concise answer, JSON object, tool call, or single-choice letter can be coherent if it is readable in context.
+Do NOT judge task correctness, factual accuracy, usefulness, safety, tool choice, length, or output format. Ignore missing <think> tags; reasoning traces may be stripped before this check.
+
+Treat the following as ALWAYS coherent — never score them 0 for these reasons:
+- Code, schemas (JSON/YAML/XML/protobuf), tables, config, math, or markup, even when long or full of repeated field/row patterns.
+- Structured answers: headers, bullet or numbered lists, step-by-step breakdowns, or "Verdict / Rationale / Next Steps"-style sections.
+- Brief answers: a single letter, number, short phrase, JSON object, or a turn whose action is a tool call with little or no prose.
 
 <conversation>
 {conversation}
 </conversation>
 
-Score 0 if ANY assistant turn is truncated, garbled, contradictory, malformed, nonsensical, repetitive, or contains roleplay-style action narration such as text in asterisks describing gestures or scene-setting.
-Score 1 only if EVERY assistant turn is coherent and complete.
+Score 0 ONLY if some assistant turn is genuinely broken language: cut off mid-word or mid-sentence, stuck in a degenerate loop repeating the same words, self-contradictory within the turn, nonsensical word-salad, or roleplay-style action narration (e.g. gestures in asterisks). Well-formed structured or code output is never a reason to score 0.
+Score 1 if every assistant turn is readable and complete. This is the normal case.
 
 Output:
 <rationale>1-2 short sentences naming the worst turn, if any</rationale>
@@ -84,10 +106,6 @@ META_RE = re.compile(
     r"scoring criteria|reward function|to get (a )?(high|good) score)\b",
     re.IGNORECASE,
 )
-STRUCTURED_MARKER_RE = re.compile(
-    r"<[A-Za-z_][A-Za-z0-9_-]*>.*?</[A-Za-z_][A-Za-z0-9_-]*>|\[[A-Z_]{2,}\]",
-    re.DOTALL,
-)
 WORD_RE = re.compile(r"[A-Za-z0-9_']+")
 STOPWORDS = {
     "a",
@@ -121,23 +139,29 @@ STOPWORDS = {
 }
 
 
+# Judge output budget. The guard prompts want a short <rationale> before the
+# <score> tag, so a tight cap truncates the reply before the score lands and the
+# verdict reads back as unparseable. Override per-run via ``judge_sampling_args``.
+JUDGE_MAX_TOKENS = 2048
+JUDGE_TIMEOUT = 120.0
+# Reward multipliers applied when a judge flags a soft violation. These are load
+# bearing but never worth tuning per run, so they stay constants, not config.
+INCOHERENT_PENALTY = 0.1
+META_PENALTY = 0.01
+
+
 @dataclass
 class AntiHackingConfig:
     judge_client: AsyncOpenAI | None = None
     judge_model: str = "google/gemma-4-26B-A4B-it"
-    judge_sampling_args: dict[str, Any] = field(default_factory=lambda: {"temperature": 0.0, "max_tokens": 512})
-    judge_timeout: float = 120.0
+    judge_sampling_args: dict[str, Any] = field(
+        default_factory=lambda: {"temperature": 0.0, "max_tokens": JUDGE_MAX_TOKENS}
+    )
     enable_judges: bool = True
-    enable_reasoning_trace: bool = True
-    enable_reasoning_coherency: bool = True
-    enable_meta_commentary: bool = True
-    reasoning_required: bool = True
+    reasoning_required: bool = False
     allow_renderer_stripped_tool_calls: bool = False
-    enable_structured_marker_gate: bool = False
     format_reward_weight: float = 0.1
     require_tool_call_for_format_reward: bool = False
-    incoherent_penalty_multiplier: float = 0.1
-    meta_commentary_multiplier: float = 0.01
 
 
 def parse_bool(value: Any) -> bool:
@@ -440,9 +464,22 @@ def extract_system_prompt(prompt: Any) -> str:
 
 
 def prompt_text(prompt: Any) -> str:
+    """Flatten system+user content. Used for term-overlap heuristics, not for judges."""
     if isinstance(prompt, list):
         return "\n".join(message_content(msg) for msg in prompt if message_role(msg) in {"system", "user"})
     return str(prompt or "")
+
+
+def format_prompt_for_judge(prompt: Any) -> str:
+    """Render a prompt as a role-labelled transcript to hand to a judge."""
+    if not isinstance(prompt, list):
+        return str(prompt)
+    parts: list[str] = []
+    for msg in prompt:
+        role = message_role(msg).upper()
+        if role:
+            parts.append(f"{role}: {message_content(msg)}")
+    return "\n\n".join(parts)
 
 
 def has_requested_output_marker(prompt: Any, visible_text: str) -> bool:
@@ -540,7 +577,7 @@ async def _judge_text(config: AntiHackingConfig, prompt: str) -> str:
             messages=[{"role": "user", "content": prompt}],
             **sampling,
         ),
-        timeout=config.judge_timeout,
+        timeout=JUDGE_TIMEOUT,
     )
     return str(response.choices[0].message.content or "")
 
@@ -600,7 +637,6 @@ class GuardedRubric(vf.Rubric):
             tool_shape = float(metrics.get("tool_call_shape", metrics.get("emitted_tool_call", 0.0)) or 0.0)
             reasoning_quality = float(metrics.get("anti_hacking_reasoning_quality", 0.0) or 0.0)
             format_reward = 0.78 * tool_shape + 0.22 * reasoning_quality
-            metrics["anti_hacking_format_reward"] = format_reward
         weight = clamp01(self.config.format_reward_weight)
         format_multiplier = (1.0 - weight) + weight * format_reward
         final_reward = multiplier * base_reward * format_multiplier
@@ -645,7 +681,7 @@ class GuardedRubric(vf.Rubric):
             "anti_hacking_reasoning_quality": float(reasoning_quality),
             "anti_hacking_format_reward": 0.0,
             "anti_hacking_local_meta": 0.0,
-            "anti_hacking_structured_marker": 0.0,
+            "anti_hacking_judge_failures": 0.0,
             "anti_hacking_coherency": -1.0,
             "anti_hacking_reasoning_ethics": -1.0,
             "anti_hacking_reasoning_coherency": -1.0,
@@ -681,11 +717,6 @@ class GuardedRubric(vf.Rubric):
                 metrics["anti_hacking_multiplier"] = 0.0
                 state["anti_hacking_breakdown"] = metrics
                 return 0.0, metrics
-        if config.enable_structured_marker_gate and STRUCTURED_MARKER_RE.search(visible_text):
-            metrics["anti_hacking_structured_marker"] = 1.0
-            metrics["anti_hacking_multiplier"] = 0.0
-            state["anti_hacking_breakdown"] = metrics
-            return 0.0, metrics
 
         if has_tool_output:
             metrics["anti_hacking_format_reward"] = 1.0
@@ -701,26 +732,18 @@ class GuardedRubric(vf.Rubric):
         multiplier = 1.0
         if META_RE.search(visible_text):
             metrics["anti_hacking_local_meta"] = 1.0
-            multiplier *= config.meta_commentary_multiplier
+            multiplier *= META_PENALTY
 
         if config.enable_judges and config.judge_client is not None:
             transcript = format_full_transcript(prompt, raw_completion)
             traces = format_reasoning_traces(prompt, raw_completion)
             system_prompt = extract_system_prompt(prompt)
-            jobs: list[tuple[str, str]] = [
+            jobs = [
                 ("coherency", COHERENCY_JUDGE_PROMPT.format(conversation=transcript)),
+                ("reasoning_ethics", REASONING_TRACE_JUDGE_PROMPT.format(reasoning_traces=traces)),
+                ("reasoning_coherency", REASONING_COHERENCY_JUDGE_PROMPT.format(reasoning_traces=traces)),
+                ("meta_commentary", META_COMMENTARY_JUDGE_PROMPT.format(system_prompt=system_prompt, conversation=transcript)),
             ]
-            if config.enable_reasoning_trace:
-                jobs.append(("reasoning_ethics", REASONING_TRACE_JUDGE_PROMPT.format(reasoning_traces=traces)))
-            if config.enable_reasoning_coherency:
-                jobs.append(("reasoning_coherency", REASONING_COHERENCY_JUDGE_PROMPT.format(reasoning_traces=traces)))
-            if config.enable_meta_commentary:
-                jobs.append(
-                    (
-                        "meta_commentary",
-                        META_COMMENTARY_JUDGE_PROMPT.format(system_prompt=system_prompt, conversation=transcript),
-                    )
-                )
             results = await asyncio.gather(
                 *(_judge_text(config, job_prompt) for _, job_prompt in jobs), return_exceptions=True
             )
@@ -735,27 +758,32 @@ class GuardedRubric(vf.Rubric):
                 for (name, _job_prompt), result in zip(jobs, results)
             }
 
-            coherency_score = parse_score_tag(parsed.get("coherency"))
-            metrics["anti_hacking_coherency"] = 0.0 if coherency_score is None else float(coherency_score)
-            if coherency_score != 1:
-                multiplier *= config.incoherent_penalty_multiplier
+            # Every judge fails open. A judge-side error, a timeout or a truncated
+            # verdict must never be indistinguishable from a guilty verdict: that
+            # turns judge downtime into a silent, uniform reward penalty. The -1.0
+            # metric default marks "no usable verdict" and is counted below.
+            scores = {name: parse_score_tag(parsed.get(name)) for name, _job_prompt in jobs}
+            metrics["anti_hacking_judge_failures"] = float(sum(score is None for score in scores.values()))
 
-            reasoning_ethics_score = parse_score_tag(parsed.get("reasoning_ethics"))
-            metrics["anti_hacking_reasoning_ethics"] = 0 if reasoning_ethics_score is None else reasoning_ethics_score
-            if reasoning_ethics_score == 1:
-                multiplier = 0.0
+            if (coherency_score := scores.get("coherency")) is not None:
+                metrics["anti_hacking_coherency"] = float(coherency_score)
+                if coherency_score == 0:
+                    multiplier *= INCOHERENT_PENALTY
 
-            reasoning_coherency_score = parse_score_tag(parsed.get("reasoning_coherency"))
-            metrics["anti_hacking_reasoning_coherency"] = (
-                1 if reasoning_coherency_score is None else reasoning_coherency_score
-            )
-            if reasoning_coherency_score == 0:
-                multiplier = 0.0
+            if (reasoning_ethics_score := scores.get("reasoning_ethics")) is not None:
+                metrics["anti_hacking_reasoning_ethics"] = float(reasoning_ethics_score)
+                if reasoning_ethics_score == 1:
+                    multiplier = 0.0
 
-            meta_score = parse_score_tag(parsed.get("meta_commentary"))
-            metrics["anti_hacking_meta_commentary"] = 0 if meta_score is None else meta_score
-            if meta_score == 1:
-                multiplier *= config.meta_commentary_multiplier
+            if (reasoning_coherency_score := scores.get("reasoning_coherency")) is not None:
+                metrics["anti_hacking_reasoning_coherency"] = float(reasoning_coherency_score)
+                if reasoning_coherency_score == 0:
+                    multiplier = 0.0
+
+            if (meta_score := scores.get("meta_commentary")) is not None:
+                metrics["anti_hacking_meta_commentary"] = float(meta_score)
+                if meta_score == 1:
+                    multiplier *= META_PENALTY
 
         metrics["anti_hacking_multiplier"] = float(multiplier)
         state["anti_hacking_breakdown"] = metrics
@@ -767,3 +795,459 @@ def guard_env(env: vf.Environment, config: AntiHackingConfig | None) -> vf.Envir
         return env
     env.rubric = GuardedRubric(env.rubric, config)
     return env
+
+
+def make_guard_config(
+    enable_anti_hacking,
+    enable_anti_hacking_judges,
+    judge_client,
+    judge_model,
+    judge_sampling_args,
+    reasoning_required,
+    allow_renderer_stripped_tool_calls,
+    format_reward_weight,
+    require_tool_call_for_format_reward=False,
+) -> AntiHackingConfig | None:
+    """Build the guard config shared by every env, reusing the task judge client."""
+    if not parse_bool(enable_anti_hacking):
+        return None
+    with_judges = parse_bool(enable_anti_hacking_judges)
+    return AntiHackingConfig(
+        judge_client=judge_client if with_judges else None,
+        judge_model=judge_model,
+        judge_sampling_args=judge_sampling_args or {"temperature": 0.0, "max_tokens": JUDGE_MAX_TOKENS},
+        enable_judges=with_judges,
+        reasoning_required=parse_bool(reasoning_required),
+        allow_renderer_stripped_tool_calls=parse_bool(allow_renderer_stripped_tool_calls),
+        format_reward_weight=float(format_reward_weight),
+        require_tool_call_for_format_reward=require_tool_call_for_format_reward,
+    )
+
+
+# --- OpenAI clients ---------------------------------------------------------
+
+
+class _RoundRobinChatCompletions:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self._clients = clients
+        self._index = 0
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return await client.chat.completions.create(*args, **kwargs)
+
+
+class _RoundRobinChat:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.completions = _RoundRobinChatCompletions(clients)
+
+
+class _RoundRobinOpenAI:
+    def __init__(self, clients: list[AsyncOpenAI]):
+        self.chat = _RoundRobinChat(clients)
+
+
+def normalize_base_urls(base_url: Any) -> list[str]:
+    if base_url is None:
+        return []
+    if isinstance(base_url, str):
+        value = base_url.strip()
+        if value.startswith("["):
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                parsed = value
+            raw_urls = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+        else:
+            raw_urls = [value]
+    elif isinstance(base_url, (list, tuple)):
+        raw_urls = base_url
+    else:
+        raw_urls = [base_url]
+
+    urls: list[str] = []
+    for raw_url in raw_urls:
+        if raw_url is None:
+            continue
+        url = str(raw_url).strip().rstrip("/")
+        if not url:
+            continue
+        if not url.endswith("/v1"):
+            url = f"{url}/v1"
+        urls.append(url)
+    return urls
+
+
+def openai_client(api_key: str, base_url: Any, http_client: Any = None) -> Any:
+    """Build a client, round-robining across several base URLs when given a list."""
+    urls = normalize_base_urls(base_url)
+    if len(urls) <= 1:
+        return AsyncOpenAI(api_key=api_key, base_url=urls[0] if urls else base_url, http_client=http_client)
+    clients = [AsyncOpenAI(api_key=api_key, base_url=url, http_client=http_client) for url in urls]
+    return _RoundRobinOpenAI(clients)
+
+
+# --- Row / payload coercion -------------------------------------------------
+
+
+def coerce(value: Any) -> Any:
+    if value is None or isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            try:
+                return ast.literal_eval(value)
+            except Exception:
+                return value
+    return value
+
+
+def normalize_tool_def(raw_tool: Any) -> dict[str, Any] | None:
+    raw_tool = coerce(raw_tool)
+    if not isinstance(raw_tool, dict):
+        return None
+    spec = raw_tool.get("function") if isinstance(raw_tool.get("function"), dict) else raw_tool
+    name = str(spec.get("name") or "").strip()
+    if not name:
+        return None
+    parameters = coerce(spec.get("parameters"))
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}}
+    tool: dict[str, Any] = {
+        "name": name,
+        "description": str(spec.get("description") or ""),
+        "parameters": parameters,
+    }
+    strict = spec.get("strict", raw_tool.get("strict"))
+    if strict is not None:
+        tool["strict"] = bool(strict)
+    return tool
+
+
+def extract_tool_defs(payload: Any) -> list[dict[str, Any]]:
+    payload = coerce(payload)
+    tools = payload.get("tools") if isinstance(payload, dict) else None
+    if not isinstance(tools, list):
+        return []
+    return [tool for tool in (normalize_tool_def(raw) for raw in tools) if tool is not None]
+
+
+def load_jsonl(repo: str, filename: str, num_examples: int, seed: int) -> list[dict[str, Any]]:
+    """Load a HF-hosted JSONL. ``num_examples=-1`` loads everything.
+
+    A positive ``num_examples`` reservoir-samples so we never hold the whole file
+    in memory for a small request. Malformed lines raise rather than being
+    skipped: a dataset that silently loses rows is worse than one that fails.
+    """
+    if num_examples < -1:
+        raise ValueError("num_examples must be -1 or non-negative")
+    if num_examples == 0:
+        return []
+
+    path = hf_hub_download(repo, filename, repo_type="dataset")
+    rows: list[dict[str, Any]] = []
+    rng = random.Random(seed)
+    seen = 0
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
+            if num_examples < 0:
+                rows.append(row)
+                continue
+            seen += 1
+            if len(rows) < num_examples:
+                rows.append(row)
+                continue
+            replacement = rng.randrange(seen)
+            if replacement < num_examples:
+                rows[replacement] = row
+
+    rng.shuffle(rows)
+    return rows
+
+
+# --- Answer extraction ------------------------------------------------------
+
+ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+ANSWER_LINE_RE = re.compile(r"^\s*(?:final\s+)?answer\s*[:=]\s*(.+?)\s*$", re.IGNORECASE)
+SCORE_TAG_RE = re.compile(r"<score>\s*([01])\s*</score>|<score>\s*([01])", re.IGNORECASE)
+
+
+def last_boxed_content(text: str) -> str | None:
+    """Return the contents of the last ``\\boxed{...}``, honouring nested braces."""
+    starts = [m.start() for m in re.finditer(r"\\boxed\s*\{", text or "")]
+    for start in reversed(starts):
+        open_idx = text.find("{", start)
+        if open_idx < 0:
+            continue
+        depth = 0
+        for idx in range(open_idx, len(text)):
+            char = text[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[open_idx + 1 : idx].strip()
+    return None
+
+
+def extract_final_answer(text: str) -> str:
+    if not text:
+        return ""
+    answer_matches = list(ANSWER_TAG_RE.finditer(text))
+    if answer_matches:
+        return answer_matches[-1].group(1).strip()
+    boxed = last_boxed_content(text)
+    if boxed is not None:
+        return boxed
+    for line in reversed(text.splitlines()):
+        answer_line = ANSWER_LINE_RE.match(line)
+        if answer_line:
+            return answer_line.group(1).strip()
+    return text.strip()
+
+
+def normalize_answer(text: Any) -> str:
+    value = str(text or "").strip()
+    value = re.sub(r"\\\[(.*?)\\\]", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"\\\((.*?)\\\)", r"\1", value, flags=re.DOTALL)
+    value = value.replace("$", "")
+    value = re.sub(r"\\boxed\{(.*?)\}", r"\1", value, flags=re.DOTALL)
+    value = re.sub(r"\s+", " ", value).strip().lower()
+    return value.strip(" .,:;`'\"")
+
+
+# --- Equivalence judge ------------------------------------------------------
+
+EQUIVALENCE_PROMPT = """You are grading final-answer equivalence.
+
+Task:
+{question}
+
+Reference answer:
+{expected}
+
+Candidate answer:
+{candidate}
+
+Score 1 if the candidate final answer is mathematically, scientifically, or factually equivalent to the reference answer. Score 0 otherwise. Ignore formatting differences, but do not give credit for unsupported guesses or answers that only partially overlap.
+
+Output exactly:
+<score>0</score> or <score>1</score>
+"""
+
+
+def parse_equivalence_score(verdict: str) -> float | None:
+    """Return 1.0/0.0, or None when the verdict is missing or self-contradictory."""
+    values = [
+        value
+        for match in SCORE_TAG_RE.finditer(verdict or "")
+        if (value := match.group(1) or match.group(2)) in {"0", "1"}
+    ]
+    if not values or len(set(values)) > 1:
+        return None
+    return 1.0 if values[-1] == "1" else 0.0
+
+
+def append_judge_log(
+    state: vf.State | None,
+    *,
+    kind: str,
+    model: str,
+    prompt: str,
+    response: str | None,
+    error: Exception | None = None,
+    parsed_score: float | None = None,
+) -> None:
+    if state is None:
+        return
+    logs = state.setdefault("judge_logs", [])
+    if not isinstance(logs, list):
+        return
+    log: dict[str, Any] = {
+        "kind": kind,
+        "model": model,
+        "prompt": prompt,
+        "response": response,
+        "error": repr(error) if error is not None else None,
+    }
+    if parsed_score is not None:
+        log["parsed_score"] = parsed_score
+    logs.append(log)
+
+
+async def judge_equivalence(
+    judge_client: Any,
+    judge_model: str,
+    judge_sampling_args: dict[str, Any] | None,
+    question: str,
+    expected: str,
+    candidate: str,
+    state: vf.State | None = None,
+    kind: str = "nemotron.equivalence",
+) -> float:
+    if normalize_answer(candidate) == normalize_answer(expected):
+        return 1.0
+    if judge_client is None:
+        return 0.0
+    sampling = {k: v for k, v in (judge_sampling_args or {}).items() if v is not None}
+    sampling.setdefault("temperature", 0.0)
+    sampling.setdefault("max_tokens", JUDGE_MAX_TOKENS)
+    judge_input = EQUIVALENCE_PROMPT.format(question=question[-4000:], expected=expected, candidate=candidate)
+    try:
+        response = await judge_client.chat.completions.create(
+            model=judge_model,
+            messages=[{"role": "user", "content": judge_input}],
+            **sampling,
+        )
+    except Exception as exc:
+        append_judge_log(state, kind=kind, model=judge_model, prompt=judge_input, response=None, error=exc)
+        return 0.0
+    verdict = str(response.choices[0].message.content or "")
+    parsed_score = parse_equivalence_score(verdict)
+    append_judge_log(
+        state,
+        kind=kind,
+        model=judge_model,
+        prompt=judge_input,
+        response=verdict,
+        parsed_score=parsed_score,
+    )
+    return parsed_score or 0.0
+
+
+# --- Disjoint train/eval splitting ------------------------------------------
+
+# Ordered most- to least-specific. Rows carrying the same identity (e.g. several
+# pivots of one recorded trajectory) must never straddle the train/eval split.
+DATASET_IDENTITY_KEYS = ("instance_id", "trajectory_id", "uuid", "problem_id", "source_record_id", "id")
+
+
+def _dataset_prompt_key(row: dict[str, Any]) -> str:
+    return json.dumps(row.get("prompt"), ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _dataset_group_key(row: dict[str, Any]) -> str:
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
+    subtask = str(info.get("subtask") or "unknown")
+    for key in DATASET_IDENTITY_KEYS:
+        value = str(info.get(key) or "").strip()
+        if value:
+            return f"{subtask}:{key}:{value}"
+    return f"{subtask}:prompt:{_dataset_prompt_key(row)}"
+
+
+def split_disjoint_dataset(
+    dataset: Dataset,
+    num_train_examples: int,
+    num_eval_examples: int,
+) -> tuple[Dataset, Dataset]:
+    """Split one source dataset into non-overlapping train and eval halves.
+
+    Holds out whole identity groups, then drops any train row whose prompt
+    matches a held-out one, so near-duplicate rows cannot leak across the split.
+    """
+    if num_train_examples < -1:
+        raise ValueError("num_train_examples must be -1 or non-negative")
+    if num_eval_examples < 0:
+        raise ValueError("num_eval_examples must be non-negative")
+    if "example_id" not in dataset.column_names:
+        dataset = dataset.add_column("example_id", range(len(dataset)))
+
+    if num_eval_examples == 0:
+        train_count = len(dataset) if num_train_examples == -1 else num_train_examples
+        if train_count > len(dataset):
+            raise ValueError(f"Requested {train_count} train examples, but only {len(dataset)} are available")
+        return dataset.select(range(train_count)), dataset.select([])
+
+    group_keys: list[str] = []
+    prompt_keys: list[str] = []
+    for row in dataset:
+        group_keys.append(_dataset_group_key(row))
+        prompt_keys.append(_dataset_prompt_key(row))
+    held_out_groups: set[str] = set()
+    eval_indices: list[int] = []
+    for index in range(len(dataset) - 1, -1, -1):
+        group_key = group_keys[index]
+        if group_key in held_out_groups:
+            continue
+        held_out_groups.add(group_key)
+        eval_indices.append(index)
+        if len(eval_indices) == num_eval_examples:
+            break
+
+    if len(eval_indices) != num_eval_examples:
+        raise ValueError(
+            f"Requested {num_eval_examples} eval examples, but only "
+            f"{len(eval_indices)} distinct source groups are available"
+        )
+    eval_indices.reverse()
+
+    held_out_prompts = {prompt_keys[index] for index in eval_indices}
+    train_indices = [
+        index
+        for index, (group_key, prompt_key) in enumerate(zip(group_keys, prompt_keys, strict=True))
+        if group_key not in held_out_groups and prompt_key not in held_out_prompts
+    ]
+    if num_train_examples >= 0:
+        train_indices = train_indices[:num_train_examples]
+        if len(train_indices) != num_train_examples:
+            raise ValueError(
+                f"Requested {num_train_examples} train examples after holding out eval groups, "
+                f"but only {len(train_indices)} are available"
+            )
+    return dataset.select(train_indices), dataset.select(eval_indices)
+
+
+def make_disjoint_dataset_builders(
+    build_dataset,
+    num_train_examples: int,
+    num_eval_examples: int,
+):
+    """Turn a single ``build_dataset(num_examples)`` into disjoint train/eval builders.
+
+    Both returned builders share one cached split, so the source file is read and
+    partitioned once no matter which side verifiers asks for first.
+    """
+    cached: tuple[Dataset, Dataset] | None = None
+
+    def build_pair() -> tuple[Dataset, Dataset]:
+        nonlocal cached
+        if cached is not None:
+            return cached
+        if num_train_examples < -1:
+            raise ValueError("num_train_examples must be -1 or non-negative")
+        if num_eval_examples < 0:
+            raise ValueError("num_eval_examples must be non-negative")
+
+        # Over-fetch so there are still enough rows left for train after whole
+        # identity groups are held out for eval.
+        load_count = -1 if num_train_examples == -1 else num_train_examples + max(num_eval_examples * 4, num_eval_examples)
+        full_dataset = build_dataset(load_count)
+        try:
+            cached = split_disjoint_dataset(full_dataset, num_train_examples, num_eval_examples)
+        except ValueError:
+            if load_count == -1:
+                raise
+            full_dataset = build_dataset(-1)
+            cached = split_disjoint_dataset(full_dataset, num_train_examples, num_eval_examples)
+        return cached
+
+    def build_train() -> Dataset:
+        return build_pair()[0]
+
+    def build_eval() -> Dataset:
+        return build_pair()[1]
+
+    return build_train, build_eval

@@ -30,11 +30,13 @@ delegates to upstream so we track future vLLM changes for free.
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncGenerator, AsyncIterable
 from functools import cached_property
 from typing import Any
 
 from fastapi import Request
+from pydantic import Field
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     PromptTokenUsageInfo,
@@ -52,6 +54,7 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from prime_rl.inference.vllm.routed_experts import RoutedExpertsCapture
+from prime_rl.utils.logger import get_logger
 
 
 class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
@@ -60,12 +63,35 @@ class PrimeRlGenerateResponseChoice(GenerateResponseChoice):
 
 class PrimeRlGenerateResponse(GenerateResponse):
     choices: list[PrimeRlGenerateResponseChoice]
+    non_finite_prompt_logprob_indices: list[int] = Field(default_factory=list)
     # Upstream ``GenerateResponse`` doesn't declare a ``usage`` field, so the
     # parent ``ServingTokens.serve_tokens_full_generator`` constructs it and
     # Pydantic silently drops it on serialization. Declare it here so the
     # router can extract per-run token counts (and cached-prefix tokens) for
     # platform billing — see https://github.com/PrimeIntellect-ai/router/pull/43.
     usage: UsageInfo | None = None
+
+
+def _sanitize_prompt_logprobs(response: PrimeRlGenerateResponse) -> None:
+    invalid_indices: list[int] = []
+    for index, entry in enumerate(response.prompt_logprobs or []):
+        if not entry:
+            continue
+        invalid = False
+        for logprob in entry.values():
+            if math.isfinite(logprob.logprob):
+                continue
+            logprob.logprob = 0.0
+            invalid = True
+        if invalid:
+            invalid_indices.append(index)
+
+    response.non_finite_prompt_logprob_indices = invalid_indices
+    if invalid_indices:
+        get_logger().warning(
+            f"Sanitized non-finite teacher prompt logprobs at {len(invalid_indices)}/"
+            f"{len(response.prompt_logprobs or [])} token positions"
+        )
 
 
 class _GenerateRoutedExpertsCapture(RoutedExpertsCapture):
@@ -355,5 +381,7 @@ class PrimeRlServingTokens(ServingTokens):
 
         if final_capture.final_res is not None:
             response.usage = _build_usage(final_capture.final_res)
+
+        _sanitize_prompt_logprobs(response)
 
         return response

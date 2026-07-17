@@ -24,6 +24,7 @@ from prime_rl.orchestrator.filters import RolloutFilter, apply_filters
 from prime_rl.orchestrator.token_usage import normalize_token_usage, rollout_token_count
 from prime_rl.orchestrator.trajectories import (
     backfill_rollout_tokens,
+    build_environment_prompt_masks,
     interleave_rollout,
     offload_images_to_disk,
 )
@@ -151,11 +152,24 @@ class TrainSink:
         needs_backfill = any(s["tokens"] is None for s in raw.get("trajectory") or [])
         if needs_backfill:
             await asyncio.to_thread(backfill_rollout_tokens, raw, self.tokenizer, renderer=self.renderer)
+        environment_supervision = (
+            self.config.training_mode == "rl" and self.train_envs.get(rollout.env_name).config.echo
+        )
+        environment_prompt_masks = None
+        if environment_supervision:
+            environment_prompt_masks = await asyncio.to_thread(
+                build_environment_prompt_masks,
+                raw,
+                self.tokenizer,
+                renderer=self.renderer,
+            )
         samples = await asyncio.to_thread(
             interleave_rollout,
             raw,
             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
             env_name=rollout.env_name,
+            environment_supervision=environment_supervision,
+            environment_prompt_masks=environment_prompt_masks,
         )
         rollout.samples = samples or []
         normalize_token_usage(raw, samples=rollout.samples)
@@ -163,6 +177,18 @@ class TrainSink:
         # tokenized, so memory stays flat instead of holding every buffered
         # rollout's images until the batch ships (no-op for text-only).
         await asyncio.to_thread(offload_images_to_disk, [raw], self.config.output_dir)
+
+        sample_lengths = [len(sample.prompt_ids) + len(sample.completion_ids) for sample in rollout.samples]
+        if sample_lengths and max(sample_lengths) > self.config.seq_len:
+            max_length = max(sample_lengths)
+            message = f"Training sample has {max_length} tokens, exceeding seq_len={self.config.seq_len}"
+            raw["error"] = {"type": "TrainingSampleTooLongError", "message": message}
+            raw["reward"] = 0.0
+            raw["is_truncated"] = True
+            raw["stop_condition"] = "training_sample_too_long"
+            raw.setdefault("metrics", {})["training_sample_too_long"] = 1.0
+            rollout.samples = []
+            get_logger().warning(f"Dropping rollout {rollout.rollout_id}: {message}")
 
     def process_group(self, group_id: uuid.UUID) -> None:
         """Finalize one GRPO group: drop errored rollouts (the whole group
@@ -205,7 +231,7 @@ class TrainSink:
                 sample.advantage = r.advantage
                 sample.reward = r.reward
                 sample.env_name = r.env_name
-                sample.training_mode = self.config.training_mode
+                sample.training_mode = "echo" if env.config.echo else self.config.training_mode
                 sample.completion_temperatures = [temperature] * len(sample.completion_ids)
 
         if self.pre_filters:
@@ -261,6 +287,11 @@ class TrainSink:
 
         if self.post_filters:
             apply_filters(self.post_filters, cohort)
+
+        for rollout in cohort:
+            if rollout.raw.get("skip_training"):
+                rollout.is_filtered = True
+                rollout.filter_results["env_non_trainable"] = True
 
         # Samples are pre-built by ``process_rollout``; ``process_group``
         # already set advantage/reward on each sample

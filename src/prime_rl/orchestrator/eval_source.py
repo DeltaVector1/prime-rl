@@ -68,12 +68,14 @@ class EvalSource:
                 self.queue.append(row)
         return fired
 
-    def next_example(self, available_permits: int) -> dict | None:
-        """Pop the next eval example if the head's permit cost fits in
-        ``available_permits``; otherwise leave it for a later call."""
+    def next_example(self, available_permits: int, *, policy_version: int) -> dict | None:
+        """Pop the next eval example when its target policy is loaded and
+        the head's permit cost fits in ``available_permits``."""
         if not self.queue:
             return None
         head = self.queue[0]
+        if int(head["eval_step"]) > policy_version:
+            return None
         env = self.eval_envs.get(head["env_name"])
         cost = env.config.group_size if env.requires_group_scoring else 1
         if cost > available_permits:
@@ -85,3 +87,7 @@ class EvalSource:
 
     def __len__(self) -> int:
         return len(self.queue)
+
+    def has_pending_before(self, policy_version: int) -> bool:
+        """Whether an older eval epoch is still waiting to be dispatched."""
+        return any(int(example["eval_step"]) < policy_version for example in self.queue)

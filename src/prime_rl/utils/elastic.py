@@ -199,6 +199,7 @@ class ElasticInferencePool:
                 headers_from_env=self.client_config.headers_from_env,
                 dp_rank_count=self.client_config.dp_rank_count,
                 extra_headers_from_state=self.client_config.extra_headers_from_state,
+                preserve_reasoning_only_responses=self.client_config.preserve_reasoning_only_responses,
             )
             self._train_clients = (
                 setup_clients(

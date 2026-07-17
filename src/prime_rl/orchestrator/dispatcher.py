@@ -12,10 +12,11 @@
   source's emptiness), so in-flight rollouts of the opposite kind drain
   naturally on either side of an eval boundary.
 - ``on_version_pending`` (called by the watcher before the engines pause for
-  the weight update) bumps ``off_policy_steps`` on in-flight train rollouts and
-  drops groups past ``max_off_policy_steps``.
-  Eval rollouts are measurements for the policy version they started with,
-  so they are allowed to finish even if training advances.
+  the weight update) bumps ``off_policy_steps`` on in-flight train rollouts,
+  drops groups past ``max_off_policy_steps``, and defers a newer weight swap
+  until every request from an older eval epoch has finished.
+  Eval epochs wait for their labeled policy version to load and remain on that
+  exact policy for the whole epoch.
   Cancellations surface as synthetic ``Cancelled`` markers so the sink's
   count-to-``group_size`` finalization still fires.
 """
@@ -173,6 +174,10 @@ class RolloutDispatcher:
         self.dispatch_allowed = asyncio.Event()
         self.dispatch_allowed.set()
 
+        # WeightWatcher waits on this when an eval for policy N is still
+        # generating and checkpoint N+1 becomes available.
+        self.eval_work_changed = asyncio.Event()
+
         self.stopped = asyncio.Event()
         self.task: asyncio.Task | None = None
 
@@ -293,14 +298,42 @@ class RolloutDispatcher:
                 "Consider increasing it to avoid this."
             )
 
+        await self.wait_for_eval_before_policy_update(step)
+
+    def has_eval_before(self, policy_version: int) -> bool:
+        """Whether generation from an older fixed-eval epoch is unfinished."""
+        source_pending = self.eval_source is not None and self.eval_source.has_pending_before(policy_version)
+        group_pending = any(
+            group.kind == "eval" and group.eval_step is not None and group.eval_step < policy_version
+            for group in self.groups.values()
+        )
+        inflight_pending = any(
+            meta.kind == "eval" and meta.eval_step is not None and meta.eval_step < policy_version
+            for meta in self.inflight.values()
+        )
+        return source_pending or group_pending or inflight_pending
+
+    async def wait_for_eval_before_policy_update(self, policy_version: int) -> None:
+        """Keep the live student weights fixed while an older eval generates."""
+        if not self.has_eval_before(policy_version):
+            return
+
+        get_logger().info(f"Deferring policy v{policy_version} weight update until the active fixed eval finishes")
+        while self.has_eval_before(policy_version):
+            self.eval_work_changed.clear()
+            if not self.has_eval_before(policy_version):
+                break
+            await self.eval_work_changed.wait()
+        get_logger().info(f"Fixed eval generation drained; policy v{policy_version} update may proceed")
+
     async def on_new_version(self, step: int) -> None:
         """No-op: the dispatcher drains in ``on_version_pending`` (pre-pause)."""
 
     async def fill_inflight(self) -> None:
         """Schedule new rollouts up to ``max_inflight``, honoring
         ``self.mode``. Eval scheduling ignores the orchestrator's dispatch
-        gate (evals are version-pinned measurements); only train scheduling
-        respects it. When ``PREFER_EVAL``'s source exhausts we flip back to
+        gate but waits until the epoch's target policy is loaded; only train
+        scheduling respects the gate. When ``PREFER_EVAL``'s source exhausts we flip back to
         ``PREFER_TRAIN`` so the eval tail drains alongside fresh train."""
         while True:
             if self.available_permits <= 0:
@@ -367,11 +400,13 @@ class RolloutDispatcher:
         a ``GroupState``. Returns ``None`` if the source is empty or the
         picked env's permit cost doesn't fit."""
         if kind == "train":
-            source = self.train_source
+            example = self.train_source.next_example(self.available_permits)
         else:
             assert self.eval_source is not None
-            source = self.eval_source
-        example = source.next_example(self.available_permits)
+            example = self.eval_source.next_example(
+                self.available_permits,
+                policy_version=self.policy.version,
+            )
         if example is None:
             return None
 
@@ -523,6 +558,8 @@ class RolloutDispatcher:
                         f"{r['error'].get('error_chain_repr', err_type)}"
                     )
             await self.emit_rollout(meta, group, r)
+        if meta.kind == "eval":
+            self.eval_work_changed.set()
 
     async def emit_rollout(self, meta: InflightRollout, group: GroupState | None, raw: vf.RolloutOutput) -> None:
         """Build a ``TrainRollout`` / ``EvalRollout`` and put it on ``out_q``.
@@ -664,6 +701,7 @@ class RolloutDispatcher:
         self.groups.clear()
         if tasks:
             await safe_cancel_all(tasks)
+        self.eval_work_changed.set()
 
     async def cancel_inflight_train_rollouts(self) -> int:
         """Cancel in-flight train rollouts, leaving eval alone. Used by the

@@ -81,8 +81,8 @@ VLLM_API_KEY=dummy prime eval run nemotron-reasoning \
 |---|---|---|
 | `dataset` | `all` | `all` (`reasoning_gym,math,science,arc_agi`), `reasoning_gym`, `math`, `science`, `arc_agi`, or comma-separated subset |
 | `num_train_examples` | `-1` | Number of shuffled train rows; `-1` uses all available rows |
-| `num_eval_examples` | `256` | Number of shuffled eval rows |
-| `dataset_seed` | `42` | Shuffle seed; eval uses `dataset_seed + 1` |
+| `num_eval_examples` | `256` | Number of source-group- and exact-prompt-disjoint held-out eval rows |
+| `dataset_seed` | `42` | Dataset sampling and shuffle seed |
 | `system_prompt` | `None` | Optional system message merged into dataset system prompts |
 | `judge_model` | `google/gemma-4-26B-A4B-it` | Model name sent to the local judge endpoint |
 | `judge_base_url` | `http://127.0.0.1:8000/v1` | OpenAI-compatible local judge endpoint |

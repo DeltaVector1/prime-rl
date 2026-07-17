@@ -47,6 +47,7 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
     build_bin_cost,
+    clip_grad_norm_,
     GarbageCollection,
     MemoryProfiler,
     Tensors,
@@ -67,7 +68,6 @@ from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
-from torchtitan.distributed.utils import clip_grad_norm_
 
 
 @clean_exit
@@ -150,8 +150,8 @@ def train(config: TrainerConfig):
     tokenizer = setup_tokenizer(config.tokenizer)
 
     # Set up the loss function
-    logger.info(f"Setting up loss function ({config.loss})")
-    loss_fns = setup_loss_fns(config.loss)
+    logger.info(f"Setting up loss functions (rl={config.loss}, opd={config.opd_loss})")
+    loss_fns = setup_loss_fns(config.loss, config.opd_loss)
 
     # Set up the optimizer
     logger.info(f"Initializing optimizer ({config.optim})")
@@ -372,7 +372,9 @@ def train(config: TrainerConfig):
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
+            rewards = micro_batch["rewards"].to("cuda") if micro_batch["rewards"] is not None else None
             loss_mask = micro_batch["loss_mask"].to("cuda")
+            environment_mask = micro_batch["environment_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             teacher_logprobs = (
                 micro_batch["teacher_logprobs"].to("cuda") if micro_batch["teacher_logprobs"] is not None else None
@@ -485,6 +487,8 @@ def train(config: TrainerConfig):
                 loss_fns=loss_fns,
                 loss_scale=loss_scale,
                 training_mode=micro_batch["training_mode"],
+                environment_mask=environment_mask.squeeze().split(sequence_lengths),
+                rewards=rewards.squeeze().split(sequence_lengths) if rewards is not None else None,
             )
 
             # Backward pass
@@ -508,9 +512,14 @@ def train(config: TrainerConfig):
             if micro_batch["training_mode"] != "sft":
                 with torch.no_grad():
                     _, _, mismatch_kl = compute_importance_ratio_and_mismatch_kl(out["logprobs"], inference_logprobs)
-                mismatch_kl = mismatch_kl[loss_mask].detach().to("cpu")
+                policy_mask = loss_mask & ~environment_mask
+                mismatch_kl = mismatch_kl[policy_mask].detach().to("cpu")
                 tensors["mismatch_kl/all"].append(mismatch_kl)
-                for env_name, indices in env_to_indices.items():
+                policy_env_names = [
+                    env_name for env_name, keep in zip(env_names, policy_mask.flatten().tolist()) if keep
+                ]
+                for env_name in set(policy_env_names):
+                    indices = [i for i, name in enumerate(policy_env_names) if name == env_name]
                     tensors[f"mismatch_kl/{env_name}"].append(mismatch_kl[indices])
 
             token_exporter.export(
@@ -603,6 +612,10 @@ def train(config: TrainerConfig):
         step_message = f"Step {progress.step} | {format_time(step_time):>7} | Loss {tensor_stats['loss/mean']:.4f} | Entropy {tensor_stats['entropy/all/mean']:.4f}"
         if "mismatch_kl/all/mean" in tensor_stats:
             step_message += f" | Mismatch KL {tensor_stats['mismatch_kl/all/mean']:.4f}"
+        if "echo_nll/mean" in tensor_stats:
+            step_message += f" | ECHO NLL {tensor_stats['echo_nll/mean']:.4f}"
+        if "echo_token_fraction/mean" in tensor_stats:
+            step_message += f" | Env. Tokens {tensor_stats['echo_token_fraction/mean']:.1%}"
         if grad_norm is not None:
             step_message += f" | Grad. Norm {grad_norm:.4f}"
         step_message += f" | LR {current_lr:.2e} | Throughput {throughput:.0f} tokens/s | MFU {mfu:.1f}% | Peak Mem. {peak_memory:.1f} GiB"

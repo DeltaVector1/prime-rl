@@ -1,0 +1,12 @@
+output_dir = "outputs/opd-protocol-recovery"
+clean_output_dir = true
+max_steps = 75
+
+[wandb]
+project = "prime-rl"
+name = "OPD-protocol-recovery-g8-t025"
+
+[ckpt]
+interval = 25
+keep_last = 3
+keep_interval = 25

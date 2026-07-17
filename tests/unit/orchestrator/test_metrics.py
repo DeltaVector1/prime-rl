@@ -1,10 +1,12 @@
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.orchestrator.eval_sink import EvalSink
 from prime_rl.orchestrator.metrics import MetricsBuilder
-from prime_rl.orchestrator.types import Progress, TrainBatchMetrics, TrainRollout
+from prime_rl.orchestrator.types import EvalRollout, Progress, TrainBatchMetrics, TrainRollout
 
 
 def _rollout(
@@ -99,3 +101,43 @@ def test_metrics_builder_logs_concrete_env_metrics_env_first(tmp_path):
 
     # Aggregate metrics intentionally keep the reserved "all" pseudo-env shape.
     assert to_log["reward/all/mean"] == pytest.approx(0.75)
+
+
+def test_eval_metrics_log_model_errors_as_zero_without_counting_cancellations():
+    env = SimpleNamespace(
+        config=SimpleNamespace(group_size=1),
+        examples=[{}, {}, {}],
+        requires_group_scoring=False,
+    )
+    eval_envs = SimpleNamespace(get=lambda _name: env)
+    sink = EvalSink(eval_envs=eval_envs)
+
+    def rollout(example_id: int, *, reward: float, error: dict | None = None) -> EvalRollout:
+        return EvalRollout(
+            raw={
+                "reward": reward,
+                "error": error,
+                "completion": [{"role": "assistant", "content": "answer"}] if error is None else None,
+                "trajectory": [{}] if error is None else [],
+                "token_usage": {"final_output_tokens": 1},
+            },
+            env_name="benchmark",
+            example_id=example_id,
+            group_id=uuid.uuid4(),
+            policy_version=0,
+            off_policy_steps=0,
+            eval_step=0,
+        )
+
+    assert sink.add(rollout(0, reward=1.0)) is None
+    assert sink.add(rollout(1, reward=0.0, error={"error": "EmptyModelResponseError"})) is None
+    batch = sink.add(rollout(2, reward=0.0, error={"error": "Cancelled"}))
+    assert batch is not None
+    assert batch.metrics.reward_mean == pytest.approx(1.0)
+    assert batch.metrics.reward_mean_including_errors == pytest.approx(0.5)
+    assert batch.metrics.n_examples == 1
+    assert batch.metrics.n_examples_including_errors == 2
+
+    logged = batch.metrics.to_wandb_dict(env_name="benchmark", step=0)
+    assert logged["eval/benchmark/avg@1"] == pytest.approx(1.0)
+    assert logged["eval/benchmark/avg@1_including_errors"] == pytest.approx(0.5)

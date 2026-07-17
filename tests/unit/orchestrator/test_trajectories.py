@@ -74,6 +74,14 @@ def test_deserialize_tool_calls_parses_arguments_when_present():
     assert deserialized[0]["tool_calls"][0]["function"]["arguments"] == {"x": 1}
 
 
+def test_deserialize_tool_calls_preserves_compact_native_calls():
+    tool_call = {"id": "1", "name": "lookup", "arguments": '{"x": 1}'}
+
+    deserialized = _deserialize_tool_calls([{"role": "assistant", "tool_calls": [tool_call]}])
+
+    assert deserialized[0]["tool_calls"] == [tool_call]
+
+
 @pytest.fixture
 def single_step_trajectory_output():
     output = vf.RolloutOutput(
@@ -616,6 +624,27 @@ def test_interleave_rollout_extension_break_creates_multiple_samples(five_step_t
     # completion_mask: step4 [T,T] + step5 prompt [F,F] + step5 completion [T,T]
     assert sample2.completion_mask == [True, True, False, False, True, True]
     assert sample2.completion_logprobs == [-0.7, -0.8, 0, 0, -0.9, -1.0]
+
+
+def test_interleave_rollout_marks_environment_extensions(five_step_trajectory_with_extension_break):
+    prompt_masks = [
+        [False, False],
+        [False, False, False, False, True, True],
+        [False, False, False, False, False, False, False, False, True, True],
+        [False, False, True, True],
+        [False, False, False, False, False, False, True, True],
+    ]
+    samples = interleave_rollout(
+        five_step_trajectory_with_extension_break,
+        environment_supervision=True,
+        environment_prompt_masks=prompt_masks,
+    )
+
+    assert samples is not None
+    assert samples[0].prompt_environment_mask == [False, False]
+    assert samples[0].completion_environment_mask == [False, False, True, True, False, False, True, True, False, False]
+    assert samples[1].prompt_environment_mask == [False, False, True, True]
+    assert samples[1].completion_environment_mask == [False, False, True, True, False, False]
 
 
 @pytest.fixture

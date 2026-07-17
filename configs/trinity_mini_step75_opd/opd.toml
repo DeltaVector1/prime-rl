@@ -1,0 +1,440 @@
+output_dir = "outputs/opd"
+clean_output_dir = true
+max_steps = 1000
+seq_len = 32768
+
+[wandb]
+project = "prime-rl"
+name = "OPD-train"
+
+[log]
+level = "info"
+
+[model]
+name = "NewEden/Trinity-Mini-Ichthyo"
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 2
+
+[ckpt]
+interval = 100
+keep_last = 2
+keep_interval = 100
+
+[trainer]
+dist_timeout_seconds = 1800
+
+[trainer.model]
+impl = "custom"
+attn = "flash_attention_2"
+ep = 2
+fsdp_cpu_offload = false
+optim_cpu_offload = true
+cp = 1
+cp_style = "ulysses"
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.ac]
+mode = "selective"
+freq = 1
+targets = ["norm", "attn_proj", "linear_attn", "routed_experts"]
+
+[trainer.model.lora]
+rank = 32
+alpha = 64
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[trainer.optim]
+type = "adamw"
+lr = 0.000001
+weight_decay = 0.0
+max_norm = 1.0
+
+[trainer.opd_loss]
+teacher_tau = 0.025
+reward_tau = 1.0
+reward_gate_teacher = true
+dppo_mask_low = 0.2
+dppo_mask_high = 0.2
+kl_tau = 0.001
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+save_sharded = true
+
+[orchestrator]
+training_mode = "opd"
+batch_size = 64
+group_size = 8
+opd_reasoning_close_advantage = 0.001
+preserve_reasoning_only_responses = true
+oversampling_factor = 0.5
+max_off_policy_steps = 2
+tasks_per_minute = 240
+renderer = "None"
+
+[orchestrator.train]
+num_workers = 4
+max_retries = 0
+
+[orchestrator.train.sampling]
+max_completion_tokens = 16384
+temperature = 1.0
+
+[orchestrator.train.sampling.extra_body]
+top_k = -1
+min_p = 0.0
+return_token_ids = true
+truncate_prompt_tokens = 16384
+
+[[orchestrator.pre_batch_filters]]
+type = "gibberish"
+enforce = false
+
+[[orchestrator.pre_batch_filters]]
+type = "repetition"
+enforce = false
+
+[[orchestrator.pre_batch_filters]]
+type = "zero_advantage"
+enforce = false
+
+[[orchestrator.post_batch_filters]]
+type = "zero_advantage"
+enforce = false
+
+[[orchestrator.train.env]]
+id = "code-env"
+name = "code-env"
+ratio = 1.0
+group_size = 8
+state_columns = ["skip_training"]
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+dataset_start_index = 64
+difficulty_key = "avg@8_qwen3_4b_instruct_2507"
+min_solve_rate = 0.0
+max_solve_rate = 0.6
+use_local_sandbox = true
+
+[[orchestrator.train.env]]
+id = "logic-env"
+name = "logic-env"
+ratio = 1.0
+group_size = 8
+state_columns = ["skip_training"]
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+dataset_start_index = 64
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.6
+
+[[orchestrator.train.env]]
+id = "science-env"
+name = "science-env"
+ratio = 1.0
+group_size = 8
+state_columns = ["skip_training"]
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset_shuffle = true
+dataset_start_index = 64
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.6
+judge_model = "gemma"
+judge_base_url = "http://195.26.233.5:40000/v1"
+judge_api_key_var = "VLLM_API_KEY"
+math_verify_timeout = 5
+
+[[orchestrator.train.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-trajectory"
+ratio = 1.0
+group_size = 8
+state_columns = ["skip_training"]
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "tool_use_trajectory"
+num_eval_examples = 64
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.train.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-function-calling"
+ratio = 1.0
+group_size = 8
+state_columns = ["skip_training"]
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "function_calling"
+num_eval_examples = 64
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.train.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-swe"
+ratio = 1.0
+group_size = 8
+state_columns = ["skip_training"]
+max_total_completion_tokens = 16384
+timeout = 1800
+
+[orchestrator.train.env.args]
+dataset = "swe_pivot"
+num_eval_examples = 64
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[orchestrator.teacher.model]
+name = "deepseek-ai/DeepSeek-V4-Flash"
+
+[orchestrator.teacher]
+recycle_after_logprobs = true
+
+[orchestrator.teacher.client]
+base_url = ["http://127.0.0.1:8001/v1"]
+timeout = 1200
+wait_for_ready_timeout = 1800
+dp_rank_count = 1
+
+[orchestrator.eval]
+interval = 25
+num_examples = 16
+group_size = 1
+max_retries = 0
+skip_first_step = false
+
+[orchestrator.eval.sampling]
+temperature = 0.0
+top_p = 1.0
+max_completion_tokens = 16384
+
+[orchestrator.eval.sampling.extra_body]
+truncate_prompt_tokens = 16384
+
+[[orchestrator.eval.env]]
+id = "code-env"
+name = "code-eval"
+
+[orchestrator.eval.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@8_qwen3_4b_instruct_2507"
+min_solve_rate = 0.0
+max_solve_rate = 0.6
+use_local_sandbox = true
+
+[[orchestrator.eval.env]]
+id = "logic-env"
+name = "logic-eval"
+
+[orchestrator.eval.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.6
+
+[[orchestrator.eval.env]]
+id = "science-env"
+name = "science-eval"
+
+[orchestrator.eval.env.args]
+dataset_shuffle = true
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.6
+judge_model = "gemma"
+judge_base_url = "http://195.26.233.5:40000/v1"
+judge_api_key_var = "VLLM_API_KEY"
+math_verify_timeout = 5
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-trajectory-eval"
+
+[orchestrator.eval.env.args]
+dataset = "tool_use_trajectory"
+num_eval_examples = 16
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-function-calling-eval"
+
+[orchestrator.eval.env.args]
+dataset = "function_calling"
+num_eval_examples = 16
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-swe-eval"
+
+[orchestrator.eval.env.args]
+dataset = "swe_pivot"
+num_eval_examples = 16
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.eval.env]]
+id = "code-env"
+name = "code-confirm"
+interval = 50
+num_examples = 48
+
+[orchestrator.eval.env.args]
+dataset_shuffle = true
+dataset_start_index = 16
+difficulty_key = "avg@8_qwen3_4b_instruct_2507"
+min_solve_rate = 0.0
+max_solve_rate = 0.6
+use_local_sandbox = true
+
+[[orchestrator.eval.env]]
+id = "logic-env"
+name = "logic-confirm"
+interval = 50
+num_examples = 48
+
+[orchestrator.eval.env.args]
+dataset_shuffle = true
+dataset_start_index = 16
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.6
+
+[[orchestrator.eval.env]]
+id = "science-env"
+name = "science-confirm"
+interval = 50
+num_examples = 48
+
+[orchestrator.eval.env.args]
+dataset_shuffle = true
+dataset_start_index = 16
+difficulty_key = "avg@16_qwen3_4b_instruct_2507"
+min_avg_reward = 0.0
+max_avg_reward = 0.6
+judge_model = "gemma"
+judge_base_url = "http://195.26.233.5:40000/v1"
+judge_api_key_var = "VLLM_API_KEY"
+math_verify_timeout = 5
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-trajectory-confirm"
+interval = 50
+num_examples = 48
+
+[orchestrator.eval.env.args]
+dataset = "tool_use_trajectory"
+num_eval_examples = 64
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-function-calling-confirm"
+interval = 50
+num_examples = 48
+
+[orchestrator.eval.env.args]
+dataset = "function_calling"
+num_eval_examples = 64
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[[orchestrator.eval.env]]
+id = "nemotron-tool-calling"
+name = "nemotron-swe-confirm"
+interval = 50
+num_examples = 48
+
+[orchestrator.eval.env.args]
+dataset = "swe_pivot"
+num_eval_examples = 64
+num_train_examples = -1
+enable_native_tool_calls = true
+enable_anti_hacking = true
+enable_anti_hacking_judges = false
+anti_hacking_reasoning_required = true
+anti_hacking_format_reward_weight = 0.0
+anti_hacking_allow_renderer_stripped_tool_calls = true
+
+[inference]
+gpu_memory_utilization = 0.95
+enable_lora = true
+enable_prefix_caching = true
+max_loras = 8
+max_cpu_loras = 32
+max_lora_rank = 32
+api_server_count = 1
+enable_expert_parallel = true
+
+[inference.model]
+max_model_len = 32768
+tool_call_parser = "hermes"
+reasoning_parser = "deepseek_r1"
+
+[inference.parallel]
+tp = 1
+dp = 2

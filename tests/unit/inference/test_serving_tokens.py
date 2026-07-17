@@ -16,6 +16,7 @@ import numpy as np
 import pybase64
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.entrypoints.serve.disagg.protocol import GenerateResponse, GenerateResponseChoice
+from vllm.logprobs import Logprob
 
 from prime_rl.inference.vllm.routed_experts import serialize_routed_experts
 from prime_rl.inference.vllm.serving_tokens import (
@@ -26,6 +27,7 @@ from prime_rl.inference.vllm.serving_tokens import (
     _client_set_max_tokens,
     _FinalOutputCapture,
     _GenerateRoutedExpertsCapture,
+    _sanitize_prompt_logprobs,
 )
 
 
@@ -147,6 +149,27 @@ def test_prime_rl_generate_response_serializes_usage_block():
         "total_tokens": 7,
         "prompt_tokens_details": None,
     }
+
+
+def test_sanitize_prompt_logprobs_records_and_replaces_non_finite_positions():
+    response = PrimeRlGenerateResponse(
+        request_id="req-non-finite",
+        choices=[],
+        prompt_logprobs=[
+            None,
+            {1: Logprob(logprob=-0.5)},
+            {2: Logprob(logprob=float("nan")), 3: Logprob(logprob=float("inf"))},
+        ],
+    )
+
+    _sanitize_prompt_logprobs(response)
+
+    assert response.non_finite_prompt_logprob_indices == [2]
+    assert response.prompt_logprobs is not None
+    assert response.prompt_logprobs[1][1].logprob == -0.5
+    assert response.prompt_logprobs[2][2].logprob == 0.0
+    assert response.prompt_logprobs[2][3].logprob == 0.0
+    response.model_dump_json()
 
 
 def test_build_usage_sums_prompt_and_completion_tokens():

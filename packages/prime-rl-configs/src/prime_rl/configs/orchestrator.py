@@ -71,6 +71,15 @@ class TrainSamplingConfig(BaseConfig):
 
         return args
 
+    @model_validator(mode="after")
+    def validate_extra_body(self):
+        if "max_prompt_len" in self.extra_body:
+            raise ValueError(
+                "sampling.extra_body.max_prompt_len is not an OpenAI/vLLM request field; "
+                "use sampling.extra_body.truncate_prompt_tokens"
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _deprecate_max_tokens(cls, data: Any) -> Any:
@@ -129,6 +138,15 @@ class EvalSamplingConfig(BaseConfig):
             args["extra_body"] = extra_body
 
         return args
+
+    @model_validator(mode="after")
+    def validate_extra_body(self):
+        if "max_prompt_len" in self.extra_body:
+            raise ValueError(
+                "sampling.extra_body.max_prompt_len is not an OpenAI/vLLM request field; "
+                "use sampling.extra_body.truncate_prompt_tokens"
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -252,6 +270,10 @@ class TrainEnvConfig(EnvConfig):
     """Advantage strategy for this env's GRPO groups. Inherits from the top-level
     ``orchestrator.advantage`` when unset; set a different ``default``/``custom``
     config to give this env its own advantage computation."""
+
+    echo: bool = False
+    """Use ECHO for this environment: keep GRPO on assistant tokens and add
+    supervised prediction loss on observations appended between turns."""
 
 
 class EvalEnvConfig(EnvConfig):
@@ -494,10 +516,19 @@ class RolloutModelConfig(BaseConfig):
 
     client: ClientConfig = ClientConfig()
 
+    recycle_after_logprobs: bool = False
+    """Restart this server after each OPD teacher-logprob batch. The server must run under a restart loop."""
+
 
 class OrchestratorConfig(BaseConfig):
     training_mode: Literal["rl", "opd", "sft"] = "rl"
     """Training mode. ``rl``: student generates rollouts, no teacher. ``opd``: student generates rollouts, teacher computes logprobs (teacher_tau > 0). ``sft``: teacher generates rollouts, student inference pool used for evals and weight sync."""
+
+    opd_reasoning_close_advantage: float | None = Field(None, ge=0)
+    """Optional sequence-normalized OPD advantage for a trainable ``</think>`` token. None uses a zero-logprob teacher target."""
+
+    preserve_reasoning_only_responses: bool = False
+    """Keep reasoning-only native generations as scored token-bearing rollouts instead of replacing them with synthetic non-trainable guards."""
 
     student: RolloutModelConfig = Field(RolloutModelConfig(), validation_alias=AliasChoices("student", "model"))
     """Student rollout participant (model + client) — the model being trained."""
@@ -765,6 +796,8 @@ class OrchestratorConfig(BaseConfig):
             raise ValueError("orchestrator.teacher must not be set when training_mode = 'rl'.")
         if self.training_mode == "opd" and not has_teacher:
             raise ValueError("orchestrator.teacher must be configured when training_mode = 'opd'.")
+        if self.training_mode != "rl" and any(env.echo for env in self.train.env):
+            raise ValueError("train.env.echo is only supported when orchestrator.training_mode = 'rl'.")
         return self
 
     @model_validator(mode="after")

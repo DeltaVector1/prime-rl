@@ -1,3 +1,4 @@
+import ast
 import json
 
 from logic_env.base import Data, Verifier
@@ -18,8 +19,8 @@ def _verifier(answer_str, user_response_str, type_safe=True):
                 response_obj = json.loads(user_response_str)
             except json.JSONDecodeError:
                 try:
-                    response_obj = eval(user_response_str)
-                except Exception:
+                    response_obj = ast.literal_eval(user_response_str)
+                except (SyntaxError, ValueError):
                     return False
             if not isinstance(response_obj, dict):
                 return False
@@ -69,15 +70,8 @@ class ZebraPuzzleVerifier(Verifier):
     def verify(self, data: Data, test_solution: str):
         extracted_answer = self.extract_answer(test_solution)
         ground_truth = data.answer
-        try:
-            correct = _verifier(answer_str=ground_truth, user_response_str=extracted_answer, type_safe=True)
-        except Exception:
-            correct = False
-        if correct:
-            acc_score = 1.0
-        else:
-            acc_score = 0
-        return acc_score
+        correct = _verifier(answer_str=ground_truth, user_response_str=extracted_answer, type_safe=True)
+        return float(correct)
 
     def extract_answer(self, test_solution: str):
         return test_solution

@@ -215,6 +215,7 @@ def setup_clients(
                     max_connections=8192,
                     max_keepalive_connections=8192,
                     max_retries=10,
+                    preserve_reasoning_only_responses=client_config.preserve_reasoning_only_responses,
                     extra_headers=headers,
                     extra_headers_from_state=client_config.extra_headers_from_state,
                     **renderer_extra,

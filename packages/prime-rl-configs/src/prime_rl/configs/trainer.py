@@ -424,6 +424,9 @@ class DefaultLossConfig(BaseConfig):
     kl_tau: float = Field(1e-3, ge=0)
     """Temperature for the KL term."""
 
+    echo_alpha: float = Field(0.1, ge=0)
+    """Cross-entropy weight for environment-observation tokens in ECHO batches."""
+
 
 class IPOLossConfig(BaseConfig):
     type: Literal["ipo"] = "ipo"
@@ -436,6 +439,9 @@ class IPOLossConfig(BaseConfig):
     kl_tau: float = Field(1e-3, ge=0)
     """Temperature for the KL term."""
 
+    echo_alpha: float = Field(0.1, ge=0)
+    """Cross-entropy weight for environment-observation tokens in ECHO batches."""
+
 
 class CustomLossConfig(BaseConfig):
     type: Literal["custom"] = "custom"
@@ -446,8 +452,31 @@ class CustomLossConfig(BaseConfig):
     kwargs: dict[str, Any] = Field(default_factory=dict)
     """Kwargs forwarded to the loss function."""
 
+    echo_alpha: float = Field(0.1, ge=0)
+    """Cross-entropy weight for environment-observation tokens in ECHO batches."""
+
 
 LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
+
+
+class OPDLossConfig(BaseConfig):
+    teacher_tau: float = Field(1.0, ge=0)
+    """Weight for the per-token teacher log-probability advantage."""
+
+    reward_tau: float = Field(0.0, ge=0)
+    """Weight for the rollout's group-relative reward advantage."""
+
+    reward_gate_teacher: bool = False
+    """Apply teacher KL only to trajectories with positive environment reward."""
+
+    dppo_mask_low: float = Field(0.2, ge=0)
+    """Lower DPPO masking threshold."""
+
+    dppo_mask_high: float = Field(0.2, ge=0)
+    """Upper DPPO masking threshold."""
+
+    kl_tau: float = Field(1e-3, ge=0)
+    """Weight for the trainer-to-inference policy KL penalty."""
 
 
 class FakeDataLoaderConfig(BaseConfig):
@@ -510,7 +539,10 @@ class TrainerConfig(BaseConfig):
     data: DataLoaderConfig = DataLoaderConfig()
 
     loss: LossConfig = DefaultLossConfig()
-    """Loss config for rl-mode batches. opd and sft batches dispatch to their own loss fns unconditionally and do not read this."""
+    """Loss config for rl-mode batches. SFT batches dispatch to masked NLL unconditionally."""
+
+    opd_loss: OPDLossConfig = OPDLossConfig()
+    """Loss weights and trust-region thresholds for OPD batches."""
 
     optim: OptimizerConfig = AdamWConfig()
 

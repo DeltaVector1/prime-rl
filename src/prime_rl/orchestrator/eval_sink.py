@@ -130,11 +130,18 @@ class EvalSink:
             n_cancelled=n_cancelled,
             n_errored=n_errored,
         )
+        metrics.group_size = self.group_size_for(env_name)
+
+        non_cancelled = [r for r in rollouts if (r.error or {}).get("error") != "Cancelled"]
+        if non_cancelled:
+            metrics.n_examples_including_errors = len({r.example_id for r in non_cancelled})
+            metrics.reward_mean_including_errors = float(
+                sum(r.reward if r.error is None else 0.0 for r in non_cancelled) / len(non_cancelled)
+            )
 
         if valid:
             rewards = [r.reward for r in valid]
             lens = [rollout_final_output_tokens(r.raw) for r in valid]
-            metrics.group_size = self.group_size_for(env_name)
             metrics.reward_mean = float(sum(rewards) / len(rewards))
             metrics.completion_len_mean = float(sum(lens) / len(lens))
             metrics.completion_len_max = float(max(lens))

@@ -30,6 +30,24 @@ from prime_rl.utils.utils import format_num, format_time, get_step_path
 DEFAULT_TIMEOUT = timedelta(seconds=600)
 
 
+def clip_grad_norm_(parameters: Iterable[Tensor], max_norm: float, *, ep_enabled: bool) -> Tensor:
+    """Clip gradients without selecting TorchTitan's empty EP bucket path."""
+    from torchtitan.distributed.utils import clip_grad_norm_ as torchtitan_clip_grad_norm_
+
+    parameters = list(parameters)
+    grad_parameters = [parameter for parameter in parameters if parameter.grad is not None]
+    has_ep_grad = any(
+        isinstance(parameter, DTensor) and "ep" in (parameter.device_mesh.mesh_dim_names or ())
+        for parameter in grad_parameters
+    )
+    has_non_ep_grad = any(
+        not isinstance(parameter, DTensor) or "ep" not in (parameter.device_mesh.mesh_dim_names or ())
+        for parameter in grad_parameters
+    )
+    use_ep_path = ep_enabled and has_ep_grad and has_non_ep_grad
+    return torchtitan_clip_grad_norm_(parameters, max_norm=max_norm, ep_enabled=use_ep_path)
+
+
 def _text_config(model_config: Any) -> Any:
     """Unwrap a multimodal model's text config, else return the config unchanged."""
     return getattr(model_config, "text_config", model_config)

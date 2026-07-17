@@ -159,8 +159,10 @@ class EvalBatchMetrics:
     n_cancelled: int
     n_errored: int
     n_examples: int = 0
+    n_examples_including_errors: int = 0
     group_size: int = 1
     reward_mean: float = 0.0
+    reward_mean_including_errors: float = 0.0
     completion_len_mean: float = 0.0
     completion_len_max: float = 0.0
     completion_len_min: float = 0.0
@@ -190,6 +192,8 @@ class EvalBatchMetrics:
             out[f"{prefix}/num_turns/max"] = self.num_turns_max
             for k, v in self.pass_at_k.items():
                 out[f"{prefix}/{k}"] = v
+        if self.n_examples_including_errors > 0:
+            out[f"{prefix}/avg@{self.group_size}_including_errors"] = self.reward_mean_including_errors
         return out
 
 

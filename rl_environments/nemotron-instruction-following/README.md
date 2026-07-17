@@ -86,8 +86,8 @@ Other instruction splits with multi-message prompts, such as `calendar`, `sysben
 |---|---|---|
 | `dataset` | `all` | `all`, `ifeval`, `structured_v2`, `structured_v2_direct`, `structured_v2_diversified`, `structured_v2_tool_calling`, `citation_format`, `freeform_formatting`, `calendar`, `multiturn`/`multichallenge`, `adversarial`, `identity`, `sysbench`, `cfbench`, `inverse_ifeval`, or comma-separated subset |
 | `num_train_examples` | `-1` | Number of shuffled train rows; `-1` uses all available rows |
-| `num_eval_examples` | `256` | Number of shuffled eval rows |
-| `dataset_seed` | `42` | Shuffle seed; eval uses `dataset_seed + 1` |
+| `num_eval_examples` | `256` | Number of source-group- and exact-prompt-disjoint held-out eval rows |
+| `dataset_seed` | `42` | Dataset sampling and shuffle seed |
 | `system_prompt` | `None` | Optional system message merged into dataset system prompts |
 | `judge_model` | `google/gemma-4-26B-A4B-it` | Model name sent to judge-graded task and guard endpoints |
 | `judge_base_url` | `http://127.0.0.1:8000/v1` | OpenAI-compatible local judge endpoint |

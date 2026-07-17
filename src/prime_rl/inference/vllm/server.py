@@ -1,4 +1,6 @@
 import asyncio
+import os
+import signal
 from argparse import Namespace
 from typing import Any
 
@@ -86,6 +88,12 @@ async def pause(request: Request):
 async def resume(request: Request):
     await engine_client(request).resume_generation()
     return {"status": "resumed"}
+
+
+@router.post("/recycle")
+async def recycle():
+    asyncio.get_running_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+    return {"status": "recycling"}
 
 
 @router.post("/update_weights")

@@ -49,6 +49,8 @@ CLI: `--env.0.id reverse-text --env.1.id math-env`.
 
 **Dicts** — TOML uses a section; CLI takes a JSON string: `--vllm-extra '{"key1": "value1"}'`.
 
+For OpenAI-compatible vLLM sampling, cap prompt tokens with `truncate_prompt_tokens` in the sampling `extra_body`. `max_prompt_len` is a benchmark option, not a chat-completions request field, and vLLM otherwise ignores it.
+
 **Discriminated unions** — set the `type` field to pick the variant (`[trainer.loss] type = "sft"`). Omit `type` to keep the default variant.
 
 **`BaseModel | None` fields** — bare flag enables defaults; nested override enables and sets:

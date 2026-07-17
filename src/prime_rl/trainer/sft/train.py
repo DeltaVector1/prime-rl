@@ -38,6 +38,7 @@ from prime_rl.trainer.sft.data import load_sft_dataset, setup_dataloader, setup_
 from prime_rl.trainer.utils import (
     GarbageCollection,
     MemoryProfiler,
+    clip_grad_norm_,
     export_benchmark_json,
     get_zero_gradient_ratio,
     get_ckpt_disk_metrics,
@@ -54,8 +55,6 @@ from prime_rl.utils.utils import clean_exit, to_col_format
 import torch.distributed as dist
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 from prime_rl.trainer.models.layers.lm_head import FUSED_CE_IGNORE_INDEX
-
-from torchtitan.distributed.utils import clip_grad_norm_
 
 
 @clean_exit
