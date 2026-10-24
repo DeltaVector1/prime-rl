@@ -720,7 +720,22 @@ class BaseTrainerConfig(BaseConfig):
         return self
 
 
+class ParityGuardConfig(BaseConfig):
+    max_unmasked_mismatch_kl: float = Field(0.1, ge=0)
+    max_masked_mismatch_kl: float = Field(0.5, ge=0)
+    max_masked_fraction: float = Field(0.06, ge=0, le=1)
+
+
 class TrainerConfig(BaseTrainerConfig):
+    parity_guard: ParityGuardConfig | None = None
+    """Reject mismatched rollout probabilities before the optimizer update."""
+
+    @model_validator(mode="after")
+    def validate_parity_guard_offload(self):
+        if self.parity_guard is not None and self.model.offload == "full":
+            raise ValueError("Parity guard requires an optimizer that updates after backward")
+        return self
+
     # RL keeps the pretrained router.
     auto_freeze_moe_router = True
     # RL optimizes the reward objective, not a fixed dataset; L2 decay toward zero fights it.

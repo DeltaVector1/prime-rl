@@ -3,6 +3,7 @@ import prime_rl._compat  # noqa: F401
 from contextlib import nullcontext
 from functools import partial
 import time
+import math
 import asyncio
 from datetime import timedelta
 
@@ -77,6 +78,31 @@ from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.worker_pool import WorkerPool
 from prime_rl.utils.pathing import resolve_latest_ckpt_step, write_resolved_config
 from prime_rl.utils.utils import clean_exit
+
+
+def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
+    """Return parity violations. Missing or nonfinite evidence fails closed."""
+    failures = []
+    unmasked = tensor_stats.get("unmasked_mismatch_kl/mean")
+    masked = tensor_stats.get("masked_mismatch_kl/mean")
+    masked_fraction = tensor_stats.get("is_masked/mean")
+
+    if unmasked is None or not math.isfinite(unmasked):
+        failures.append("unmasked mismatch KL is missing or nonfinite")
+    elif unmasked > guard.max_unmasked_mismatch_kl:
+        failures.append(f"unmasked mismatch KL {unmasked:.6f} > {guard.max_unmasked_mismatch_kl:.6f}")
+
+    if masked_fraction is None or not math.isfinite(masked_fraction):
+        failures.append("masked token fraction is missing or nonfinite")
+    else:
+        if masked_fraction > guard.max_masked_fraction:
+            failures.append(f"masked token fraction {masked_fraction:.6f} > {guard.max_masked_fraction:.6f}")
+        if masked_fraction > 0:
+            if masked is None or not math.isfinite(masked):
+                failures.append("masked mismatch KL is missing or nonfinite")
+            elif masked > guard.max_masked_mismatch_kl:
+                failures.append(f"masked mismatch KL {masked:.6f} > {guard.max_masked_mismatch_kl:.6f}")
+    return failures
 
 
 @clean_exit
@@ -594,6 +620,17 @@ def train(config: TrainerConfig):
         # Free this batch before the next one is received and converted
         del micro_batches, micro_batch
 
+        tensor_stats = tensors.compute_stats()
+        del tensors
+        if config.parity_guard is not None:
+            violations = parity_guard_failures(tensor_stats, config.parity_guard)
+            if violations:
+                asyncio.run(monitors.log({**tensor_stats, "diagnostic/parity_guard_rejected": 1.0}, step=progress.step))
+                optimizer.zero_grad()
+                raise RuntimeError(
+                    "Parity guard rejected step before optimizer update and weight broadcast: " + "; ".join(violations)
+                )
+
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
         # across dp_cp so the final gradient is the true per-token mean over the global batch.
         if gradient_manager is None:
@@ -603,6 +640,9 @@ def train(config: TrainerConfig):
         grad_norm: torch.Tensor | None = None
         if config.optim.max_norm is not None:
             grad_norm = clip_grad_norm_(gradient_manager, model, config.optim.max_norm)
+            if not torch.isfinite(grad_norm):
+                optimizer.zero_grad()
+                raise RuntimeError("Nonfinite gradient norm before optimizer update and weight broadcast")
 
         # Update the model parameters
         optimizer.step()
@@ -652,10 +692,6 @@ def train(config: TrainerConfig):
         if memory_profiler is not None:
             memory_profiler.step()
 
-        # Synchronize the tensor metrics across all steps and ranks
-        tensor_stats = tensors.compute_stats()
-        # The gathered per-token values hold every rank's tokens; free them before the next batch loads
-        del tensors
         if is_moe_model:
             tensor_stats.update(get_expert_load_stats(step_tokens_per_expert, dp_cp_group))
 
