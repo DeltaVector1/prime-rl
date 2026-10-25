@@ -14,9 +14,13 @@ from verifiers.v1.types import AssistantMessage, Tool, ToolMessage, Usage, UserM
 from prime_rl.configs.algorithm import GRPOAlgoConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.algo.base import Algorithm
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
+from prime_rl.orchestrator.dispatcher import Dispatcher
+from prime_rl.orchestrator.envs import Envs
 from prime_rl.orchestrator.train_sink import TrainSink
+from prime_rl.orchestrator.train_source import TrainSource
 from prime_rl.orchestrator.trajectories import trace_to_samples
-from prime_rl.orchestrator.types import DispatchFailure, GroupCancellation, Progress
+from prime_rl.orchestrator.types import DispatchFailure, GroupCancellation, Policy, Progress
 from prime_rl.utils.logger import setup_logger
 
 setup_logger("warning")
@@ -40,7 +44,7 @@ def trace(*, advantage=1.0, ok=True, trainable=True, sampled=True):
             mask=[sampled, sampled],
             is_content=[True, True],
             logprobs=[-0.1, -0.2],
-            advantages=[advantage, advantage],
+            advantages=[advantage, advantage] if advantage is not None else None,
             reference_logprobs=[-0.3, -0.4],
             routed_experts=np.ones((2, 2, 2), dtype=np.uint8),
         ),
@@ -228,5 +232,172 @@ def test_partial_window_and_shutdown_release():
         assert window.attempts == 1
         assert window.metrics.to_dict()["rollout/queued/cancelled"] == 1
         assert s.take_rollout_window(force=True) is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("outcome", ["episode", "trace", "dispatch", "all_failed", "overload"])
+@pytest.mark.parametrize("failure_first", [False, True])
+def test_grpo_failed_group_is_not_scored_or_admitted(outcome, failure_first):
+    async def run():
+        s = sink(batch_size=16)
+        env = s.train_envs.get("test")
+        env.config.group_size = 16
+        env.algorithm = GRPOAlgorithm(GRPOAlgoConfig(), None)
+        admitted = []
+        s.on_result = lambda group: admitted.append(group) or True
+        good = [episode([trace(advantage=None)], group="failed") for _ in range(15)]
+        bad = episode([trace(advantage=None)], group="failed")
+        if outcome == "episode":
+            bad.ok = False
+        elif outcome == "trace":
+            bad.traces[0].errors.append(vf.Error(type="Timeout", message="deadline"))
+            bad.traces[0].ok = False
+        elif outcome in ("dispatch", "all_failed"):
+            bad = DispatchFailure(
+                kind="train",
+                env_name="test",
+                group_id="failed",
+                step=1,
+                policy_version=0,
+                task_type="Task",
+                task_key="key",
+                task_hash="hash",
+                error=vf.Error(type="TransportError", message="request failed"),
+            )
+        else:
+            bad = GroupCancellation("train", "test", "failed", 1, 1, "overload")
+        items = ([bad] + good if failure_first else good + [bad]) if outcome != "all_failed" else [bad] * 16
+        for item in items:
+            if isinstance(item, DispatchFailure):
+                result = await s.fail(item)
+            elif isinstance(item, GroupCancellation):
+                result = await s.cancel(item)
+            else:
+                result = await s.add(item)
+            assert result is None
+        assert not admitted
+        assert not s.pending_batch and not s.episode_by_trace
+        assert not s.pending_groups and not s.pending_group_failures and not s.pending_group_cancellations
+        assert all(ep.traces[0].nodes[2].advantages is None for ep in good)
+        window = s.take_rollout_window(force=True)
+        assert window.groups == 1
+        assert window.attempts == window.discarded == 16
+        assert window.errored == (16 if outcome == "all_failed" else 0 if outcome == "overload" else 1)
+        if outcome == "trace":
+            assert bad.traces[0].errors[0].type == "Timeout"
+        assert s.zero_output_units > 0
+
+    asyncio.run(run())
+
+
+def test_grpo_replaces_failed_group_and_fills_batch_with_source_credits():
+    async def run():
+        async def finish_sessions(ids):
+            pass
+
+        count = 0
+
+        async def run_episode(*, task_data, **kwargs):
+            nonlocal count
+            index = count
+            count += 1
+            if index == 7:
+                raise RuntimeError("local request failure")
+            task = vf.Task(vf.TaskData(**task_data))
+            t = trace(advantage=None)
+            t.rewards = {"correct": vf.Reward(score=float(index % 2))}
+            t.task = vf.TraceTask(type=type(task).__name__, data=task.data, key=task.key, hash=task.hash)
+            return vf.Episode(env=vf.EnvInfo(id="test", name="test"), task=t.task, traces=[t], ok=True)
+
+        clients = SimpleNamespace(train_client=None, finish_sessions=finish_sessions)
+        env = SimpleNamespace(
+            name="test",
+            clients=clients,
+            uses_live_policy=True,
+            run=run_episode,
+            tasks=[vf.Task(vf.TaskData(idx=i, prompt=f"task {i}")) for i in range(130)],
+            num_tasks=130,
+            config=SimpleNamespace(
+                group_size=16,
+                max_outstanding=1,
+                ratio=1.0,
+                curriculum=None,
+                sampling=SimpleNamespace(temperature=1.0),
+            ),
+            algorithm=GRPOAlgorithm(GRPOAlgoConfig(), None),
+            requires_sampling_masks=False,
+            requires_top_logprobs=False,
+        )
+        envs = Envs()
+        envs._envs = {"test": env}
+        source = TrainSource(envs)
+        progress = Progress()
+        s = TrainSink(
+            OrchestratorConfig(batch_size=2048, constant_trainer_batch_size=True),
+            tokenizer=None,
+            train_envs=envs,
+            progress=progress,
+            batch_size=2048,
+            on_result=source.on_result,
+        )
+        dispatcher = Dispatcher(
+            train_envs=envs,
+            eval_envs=None,
+            train_source=source,
+            eval_source=None,
+            policy_clients=clients,
+            policy=Policy(),
+            progress=progress,
+            initial_max_inflight=4,
+            max_inflight_ceiling=4,
+            dispatch_per_minute=None,
+            max_off_policy_steps=1,
+            run_id="local",
+            run_name=None,
+        )
+        batch = None
+        first_group = None
+        try:
+            for index in range(2064):
+                await dispatcher.fill_inflight()
+                assert dispatcher.current_inflight == 1
+                assert dispatcher.inflight_by_env == {("train", "test"): 1}
+                task = next(iter(dispatcher.inflight))
+                await asyncio.wait({task}, timeout=1)
+                await dispatcher.handle_completed_request(task)
+                assert dispatcher.current_inflight == 0 and not dispatcher.inflight_by_env
+                item = dispatcher.out_q.get_nowait()
+                if isinstance(item, DispatchFailure):
+                    batch = await s.fail(item)
+                else:
+                    first_group = first_group or item.group.id
+                    batch = await s.add(item)
+                if index < 2063:
+                    assert batch is None
+                if index == 15:
+                    assert not dispatcher.groups
+                    assert not s.pending_batch and not s.pending_groups and not s.pending_group_failures
+                    assert source.curricula["test"].sampler.state_dict()["cursor"] == 1
+            assert batch is not None
+            assert len(batch.samples) == batch.cohort.num_traces == 2048
+            assert all(ep.group.id != first_group for ep in batch.cohort)
+            groups = {}
+            for ep in batch.cohort:
+                groups[ep.group.id] = groups.get(ep.group.id, 0) + 1
+            assert len(groups) == 128 and set(groups.values()) == {16}
+            assert {value for sample in batch.samples for value in sample.advantages if value} == {-0.5, 0.5}
+            assert not s.pending_batch and not s.pending_groups and not s.pending_group_failures
+            window = s.take_rollout_window(force=True)
+            assert window.attempts == 2064 and window.discarded == 16 and window.errored == 1
+            assert source._admitted == {"test": 128}
+            saved = source.state_dict()
+            restored = TrainSource(envs)
+            restored.load_state_dict(saved)
+            assert restored.state_dict() == saved
+            assert restored.next_task(step=1).task.key == source.next_task(step=1).task.key
+        finally:
+            await dispatcher.cancel_inflight_episodes()
+        assert not dispatcher.groups and dispatcher.current_inflight == 0
 
     asyncio.run(run())

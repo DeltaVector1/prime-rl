@@ -18,6 +18,7 @@ import verifiers.v1 as vf
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.algo.base import iter_trainable_traces
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.routing import stamp_loss_routing
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.metrics import RolloutWindow, TrainEpisodes
@@ -226,6 +227,23 @@ class TrainSink:
                 f"Dropped group | env={env_name} task_idx={task_idx} | "
                 f"episodes={len(group)} traces={len(traces)} (errored={num_errored}) | "
                 f"reason=cancelled ({cancellation.reason})"
+            )
+            return
+
+        # GRPO needs a complete group. A partial group changes the reward
+        # baseline and must not become a curriculum result or train payload.
+        if isinstance(env.algorithm, GRPOAlgorithm) and (
+            failures
+            or cancellation is not None
+            or any(not episode.ok for episode in group)
+            or any(trace.has_error for trace in traces)
+        ):
+            self._record_group(group, failures, cancellation, env_name, admitted=False)
+            self._record_zero_output(group, [], n_owed)
+            get_logger().debug(
+                f"Dropped group | env={env_name} task_idx={task_idx} | "
+                f"episodes={len(group)} traces={len(traces)} (errored={num_errored}) | "
+                "reason=incomplete GRPO group"
             )
             return
 
