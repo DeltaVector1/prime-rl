@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "dependencies": [
+    {
+      "name": "renderers",
+      "base": "dc0b49282f2d823fa65c513f0528e700c4eac3d5",
+      "target": "75e19f35dd03f7ff57081a5b536f8e2ac7a60240",
+      "patch": "renderers.patch",
+      "sha256": "0ebb043110b1307950c7dda57d12ca6fab04233c1a77c7004ba94422049488fd",
+      "reviewer_diff_sha256": "54c7e9826b730cace4e92f6cb055aacaf0f837369517b2402452d093b49edf5b"
+    },
+    {
+      "name": "verifiers",
+      "base": "2f6ed0ce6e04e26b713801a3e701e857b6f36452",
+      "target": "073d7f1c3b1307343adc3e7db049aa61423c07f0",
+      "patch": "verifiers.patch",
+      "sha256": "2fc191bb7340ae23669daac2bb1485c2cfa18b558e3c52b40c42494a915c8984",
+      "reviewer_diff_sha256": "70da4f2c082c6f8aeeb555763e51ae1eb606a63440d5354151bbdc0513c5e47c"
+    }
+  ],
+  "install_contract": [
+    "Run native frozen sync while preserving editable dependencies at their upstream base gitlinks.",
+    "Check this bundle against the explicit native repository root, then apply it and check again.",
+    "Install ported Xiaomi wheels with --no-deps. Xiaomi toolkit reference commit: 10216e63f9bc78a053f253bd4fbf2e0b45481a84; toolkit is not bundled here.",
+    "Run the native runtime with --no-sync. Do not run a normal Xiaomi uv sync that replaces the native dependency pins."
+  ]
+}

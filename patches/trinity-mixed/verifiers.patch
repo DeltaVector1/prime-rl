@@ -1,0 +1,296 @@
+diff --git a/tests/unit/test_output_budget.py b/tests/unit/test_output_budget.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..61ae9db9ed910f4cb046c526f0cffec8c7f112fe
+--- /dev/null
++++ b/tests/unit/test_output_budget.py
+@@ -0,0 +1,162 @@
++"""Opt-in cumulative output limits at the actual model-request boundary."""
++
++import asyncio
++import json
++
++import pytest
++from aiohttp.test_utils import make_mocked_request
++
++import verifiers.v1 as vf
++from verifiers.v1.clients import ModelContext
++from verifiers.v1.clients.train import response_from_generate, serialize_completion
++from verifiers.v1.configs.client import EvalClientConfig
++from verifiers.v1.dialects.chat import ChatDialect
++from verifiers.v1.interception.server import InterceptionServer
++from verifiers.v1.session import RolloutLimits, RolloutSession
++
++
++class RecordingClient:
++    def __init__(self, outputs):
++        self.outputs = iter(outputs)
++        self.requests = []
++
++    async def get_response(self, dialect, body, sampling, **kwargs):
++        self.requests.append((body, sampling))
++        await asyncio.sleep(0)
++        count = min(next(self.outputs), sampling.max_tokens)
++        turn = kwargs["turn"]
++        prefix = [
++            token
++            for node in turn.prefix_node_ids
++            for token in turn.trace.nodes[node].token_ids
++        ]
++        response = response_from_generate(
++            {
++                "prompt_ids": prefix + [1],
++                "completion_ids": [2] * count,
++                "completion_logprobs": [-0.1] * count,
++                "content": "answer",
++                "reasoning_content": "reasoning",
++                "finish_reason": "stop",
++            },
++            "policy",
++        )
++        response.raw = serialize_completion(response, "policy")
++        return response
++
++
++def make_session(outputs, *, strict=True, budget=32768, cap=32768):
++    config = vf.AgentConfig(max_output_tokens=budget, strict_output_token_budget=strict)
++    trace = vf.Trace(
++        agent=vf.AgentInfo(config=config),
++        task=vf.TraceTask(type="Task", data=vf.TaskData(idx=0, prompt="hello")),
++    )
++    client = RecordingClient(outputs)
++    session = RolloutSession(
++        ctx=ModelContext(
++            model="policy",
++            client=EvalClientConfig(),
++            sampling=vf.SamplingConfig(max_tokens=cap, temperature=0.7, top_k=20),
++        ),
++        trace=trace,
++        limits=RolloutLimits(
++            max_output_tokens=budget, strict_output_token_budget=strict
++        ),
++        client=client,
++    )
++    server = InterceptionServer()
++    server.sessions["secret"] = session
++    return server, session, client
++
++
++async def request(server, turn, cap=32768, messages=None):
++    req = make_mocked_request(
++        "POST", "/v1/chat/completions", headers={"Authorization": "Bearer secret"}
++    )
++    req._read_bytes = json.dumps(
++        {
++            "model": "policy",
++            "messages": messages or [{"role": "user", "content": f"branch {turn}"}],
++            "max_completion_tokens": cap,
++        }
++    ).encode()
++    return await server.handle_request(req, ChatDialect())
++
++
++@pytest.mark.parametrize("outputs", [[20000, 20000], [10000, 10000, 20000]])
++async def test_cumulative_budget_caps_native_requests(outputs):
++    server, session, client = make_session(outputs)
++    used = 0
++    messages = []
++    for turn, output in enumerate(outputs):
++        messages.append({"role": "user", "content": f"turn {turn}"})
++        response = await request(server, turn, messages=messages)
++        assert response.status == 200
++        messages.append(json.loads(response.body)["choices"][0]["message"])
++        body, sampling = client.requests[-1]
++        assert body["max_tokens"] == sampling.max_tokens == 32768 - used
++        assert "max_completion_tokens" not in body
++        assert sampling.temperature == 0.7 and sampling.top_k == 20
++        used += min(output, sampling.max_tokens)
++    assert session.trace.num_output_tokens == 32768
++    assert (await request(server, "exhausted")).status == 400
++    assert len(client.requests) == len(outputs)
++    assert session.trace.stop_condition == "max_output_tokens"
++    assert session.ctx.sampling.max_tokens == 32768
++    # Native completion ids include reasoning; preserve tokens and their logprobs.
++    assert session.trace.last_reply == "answer"
++    assert session.trace.num_branches == 1
++    assert all(
++        n.message.reasoning_content == "reasoning"
++        for n in session.trace.nodes
++        if n.sampled
++    )
++    assert all(len(b.logprobs) == len(b.token_ids) for b in session.trace.branches)
++    assert sum(sum(n.mask) for n in session.trace.nodes) == 32768
++    assert all(
++        n.logprobs == [-0.1] * sum(n.mask) for n in session.trace.nodes if n.sampled
++    )
++
++
++@pytest.mark.parametrize(
++    "cap,source,expected", [(1024, 32768, 1024), (32768, 512, 512)]
++)
++async def test_lower_client_or_source_request_cap_is_preserved(cap, source, expected):
++    server, session, client = make_session([32768], cap=cap)
++    assert (await request(server, 0, cap=source)).status == 200
++    assert client.requests[0][0]["max_tokens"] == expected
++    assert client.requests[0][1].max_tokens == expected
++    assert session.trace.num_output_tokens == expected
++
++
++async def test_zero_budget_does_not_generate():
++    server, session, client = make_session([], budget=0)
++    assert (await request(server, 0)).status == 400
++    assert client.requests == []
++    assert session.trace.stop_condition == "max_output_tokens"
++
++
++async def test_default_soft_budget_still_allows_crossing_response():
++    assert vf.AgentConfig().strict_output_token_budget is False
++    server, session, client = make_session([20000, 20000], strict=False)
++    for turn in range(2):
++        assert (await request(server, turn)).status == 200
++    assert [s.max_tokens for _, s in client.requests] == [32768, 32768]
++    assert session.trace.num_output_tokens == 40000
++
++
++async def test_parallel_branches_share_budget():
++    server, session, client = make_session([20000, 20000])
++    responses = await asyncio.gather(request(server, 0), request(server, 1))
++    assert [r.status for r in responses] == [200, 200]
++    assert [s.max_tokens for _, s in client.requests] == [32768, 12768]
++    assert session.trace.num_output_tokens == 32768
++
++
++async def test_other_agent_session_has_its_own_budget():
++    policy, policy_session, _ = make_session([32768])
++    judge, judge_session, _ = make_session([100], strict=False)
++    assert (await request(policy, 0)).status == 200
++    assert (await request(judge, 0)).status == 200
++    assert policy_session.trace.num_output_tokens == 32768
++    assert judge_session.trace.num_output_tokens == 100
+diff --git a/verifiers/v1/agent.py b/verifiers/v1/agent.py
+index f09f4bc1b3faf188b24422359c136765e0a1d8ca..b7f7d6d98a5f42691a1e0ced1d9927725a49d517 100644
+--- a/verifiers/v1/agent.py
++++ b/verifiers/v1/agent.py
+@@ -574,6 +574,7 @@ class Agent:
+             max_turns=config.max_turns,
+             max_input_tokens=config.max_input_tokens,
+             max_output_tokens=config.max_output_tokens,
++            strict_output_token_budget=config.strict_output_token_budget,
+             max_total_tokens=config.max_total_tokens,
+             max_turn_tokens=config.max_turn_tokens,
+         )
+diff --git a/verifiers/v1/configs/agent.py b/verifiers/v1/configs/agent.py
+index 42710cd39112fee39a9d7fb836de953136cc62e0..556a065e2005070e28e2186679a5e6d8bf164b43 100644
+--- a/verifiers/v1/configs/agent.py
++++ b/verifiers/v1/configs/agent.py
+@@ -63,7 +63,12 @@ class AgentConfig(BaseConfig):
+     max_input_tokens: int | None = None
+     """Max input tokens per run (None = no limit)."""
+     max_output_tokens: int | None = None
+-    """Max output tokens per run (None = no limit)."""
++    """Max output tokens per run (None = no limit). Soft by one response unless
++    `strict_output_token_budget` is enabled."""
++    strict_output_token_budget: bool = False
++    """Cap each request to the remaining `max_output_tokens`, including reasoning.
++    Concurrent requests within this agent's run are serialized to share the budget.
++    Has no effect when `max_output_tokens` is None."""
+     max_total_tokens: int | None = None
+     """Max total tokens per run (None = no limit)."""
+     max_turn_tokens: int | None = Field(None, gt=0)
+diff --git a/verifiers/v1/interception/server.py b/verifiers/v1/interception/server.py
+index fa04f6e30699c3d93a8b59ed5cb1e8016351b864..e1eb6fdeaf985765976daee5b935ed01bca577b1 100644
+--- a/verifiers/v1/interception/server.py
++++ b/verifiers/v1/interception/server.py
+@@ -575,6 +575,17 @@ class InterceptionServer(Interception):
+ 
+     async def handle_request(
+         self, request: web.Request, dialect: Dialect
++    ) -> web.StreamResponse:
++        session = self.sessions.get(dialect.secret(request.headers))
++        if session is not None and session.strict_output_token_budget:
++            session.adopt(asyncio.current_task())
++            # Hold through trace commit so parallel branches cannot spend the same tokens.
++            async with session.output_budget_lock:
++                return await self._handle_request(request, dialect)
++        return await self._handle_request(request, dialect)
++
++    async def _handle_request(
++        self, request: web.Request, dialect: Dialect
+     ) -> web.StreamResponse:
+         session = self.sessions.get(dialect.secret(request.headers))
+         if session is None:
+@@ -598,7 +609,10 @@ class InterceptionServer(Interception):
+             body = from_json(raw)
+         except ValueError:
+             body = json.loads(raw)
+-        body = dialect.apply_overrides(body, session.ctx.model, session.ctx.sampling)
++        sampling = session.ctx.sampling
++        if session.strict_output_token_budget:
++            sampling = session.request_sampling(dialect.parse_sampling(body))
++        body = dialect.apply_overrides(body, session.ctx.model, sampling)
+         streaming = dialect.streaming(body)
+         # A streamed request is served whole once its turn commits: the eval client's
+         # provider stream is read to the end, and the train client generates the response.
+@@ -792,7 +806,7 @@ class InterceptionServer(Interception):
+                         call_response = await session.client.get_response(
+                             dialect,
+                             body,
+-                            session.ctx.sampling,
++                            sampling,
+                             headers=upstream_headers,
+                             session_id=session.trace.id,
+                             turn=turn,
+diff --git a/verifiers/v1/session.py b/verifiers/v1/session.py
+index 1e7a0551fedcd3ef0259127186a4fe26c4ac5507..841e1ab84c096aa9cd4cb9b88916b3a6f4f796f3 100644
+--- a/verifiers/v1/session.py
++++ b/verifiers/v1/session.py
+@@ -39,6 +39,7 @@ from verifiers.v1.types import (
+     Messages,
+     Request,
+     Response,
++    SamplingConfig,
+     ToolCall,
+     ToolMessage,
+     UserMessage,
+@@ -88,6 +89,7 @@ class RolloutLimits:
+     `max_turns` -> num_turns, `max_input_tokens` -> num_input_tokens, `max_output_tokens` ->
+     num_output_tokens, `max_total_tokens` -> num_total_tokens. Token caps are soft by one turn:
+     they're checked between turns, so the turn that crosses a cap still completes.
++    `strict_output_token_budget` additionally caps requests to remaining output tokens.
+     `max_turn_tokens` caps each response (applied through sampling) and refuses the turn
+     after a response that hit it."""
+ 
+@@ -96,6 +98,7 @@ class RolloutLimits:
+     max_output_tokens: int | None = None
+     max_total_tokens: int | None = None
+     max_turn_tokens: int | None = None
++    strict_output_token_budget: bool = False
+ 
+     def reached(self, trace: Trace) -> str | None:
+         """The name of the first limit `trace` has reached, or None if within all caps."""
+@@ -204,6 +207,26 @@ class RolloutSession:
+     gated_tools: set[tuple[str, str]] = field(default_factory=set)
+     """Calls the harness's gate asked about before executing."""
+     prepared_users: Counter[str] = field(default_factory=Counter)
++    output_budget_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
++
++    @property
++    def strict_output_token_budget(self) -> bool:
++        return (
++            self.limits.strict_output_token_budget
++            and self.limits.max_output_tokens is not None
++        )
++
++    def request_sampling(self, source: SamplingConfig) -> SamplingConfig:
++        """Keep the run's sampling knobs, capping output before generation."""
++        sampling = self.ctx.sampling
++        if not self.strict_output_token_budget:
++            return sampling
++        remaining = max(0, self.limits.max_output_tokens - self.trace.num_output_tokens)
++        caps = [remaining]
++        caps.extend(
++            cap for cap in (sampling.max_tokens, source.max_tokens) if cap is not None
++        )
++        return sampling.model_copy(update={"max_tokens": min(caps)})
+ 
+     @property
+     def stopped(self) -> bool:

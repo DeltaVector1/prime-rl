@@ -1,0 +1,519 @@
+diff --git a/renderers/configs.py b/renderers/configs.py
+index d6013132f0bfc2ab36bb9cd33b713b1857e89acf..7c4e18276fe8275d6142227c5bcd149f3b608df9 100644
+--- a/renderers/configs.py
++++ b/renderers/configs.py
+@@ -145,7 +145,8 @@ class DefaultRendererConfig(BaseRendererConfig):
+ 
+     tool_parser: str | None = None
+     """Name of a tool parser registered in ``renderers.parsers`` (e.g.
+-    ``"qwen3"``, ``"glm"``). Consumed only by ``DefaultRenderer``."""
++    ``"qwen3"``, ``"glm"``, ``"hermes"``). ``"hermes"`` supports ordinary
++    multi-token tags, including Trinity-Mini. Consumed only by ``DefaultRenderer``."""
+ 
+     reasoning_parser: str | None = None
+     """Name of a reasoning parser registered in ``renderers.parsers``
+diff --git a/renderers/default.py b/renderers/default.py
+index 5d1756e31f2fc30848c5f2f5e64dffdd55db8617..06d42052fc7d0d9b3bad729022aec8a7ffe6245f 100644
+--- a/renderers/default.py
++++ b/renderers/default.py
+@@ -11,8 +11,6 @@ from __future__ import annotations
+ import json
+ from typing import Any
+ 
+-from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
+-
+ from renderers.base import (
+     ChatTemplateTokenizer,
+     Message,
+@@ -22,17 +20,18 @@ from renderers.base import (
+     extract_message_tool_names,
+     resolve_thinking_retention,
+ )
+-from renderers.parsing import (
+-    _reasoning_end_token_index,
+-    _strip_stop_tokens,
+-)
+-
+ from renderers.configs import DefaultRendererConfig
+ from renderers.parsers import (
++    HermesToolParser,
+     ThinkTextReasoningParser,
+     get_reasoning_parser,
+     get_tool_parser,
+ )
++from renderers.parsing import (
++    _reasoning_end_token_index,
++    _strip_stop_tokens,
++)
++from renderers.reasoning import prompt_ends_in_reasoning, scan_reasoning
+ 
+ 
+ def _decode_tool_call_arguments(messages: list) -> list:
+@@ -189,7 +188,7 @@ class DefaultRenderer:
+         self,
+         token_ids: list[int],
+         *,
+-        tools: list[ToolSpec] | None = None,  # noqa: ARG002 — DefaultRenderer relies on configured tool_parser, schema not consulted here
++        tools: list[ToolSpec] | None = None,
+         prompt_ids: list[int] | None = None,
+     ) -> ParsedResponse:
+         ids = _strip_stop_tokens(token_ids, set(self.get_stop_token_ids()))
+@@ -213,20 +212,29 @@ class DefaultRenderer:
+         )
+         # 1. Extract tool calls while we still have token ids (most formats
+         #    use special-token delimiters, so id-level matching is reliable).
+-        if self._tool_parser is not None:
++        content_text = None
++        if isinstance(self._tool_parser, HermesToolParser):
++            content_text, tool_calls = self._tool_parser.extract_text(
++                ids[reasoning_end:]
++            )
++            content_ids = ids[:reasoning_end]
++        elif self._tool_parser is not None:
+             content_ids, tool_calls = self._tool_parser.extract(ids[reasoning_end:])
+             content_ids = [*ids[:reasoning_end], *content_ids]
+-            for tc in tool_calls:
+-                if tc.token_span is not None:
+-                    start, end = tc.token_span
+-                    tc.token_span = (start + reasoning_end, end + reasoning_end)
+         else:
+             content_ids = ids
+             tool_calls = []
+ 
++        for tc in tool_calls:
++            if tc.token_span is not None:
++                start, end = tc.token_span
++                tc.token_span = (start + reasoning_end, end + reasoning_end)
++
+         # 2. Decode (keep special tokens so a downstream reasoning parser can
+         #    still see things like <think>/</think> when they're tokens).
+         text = self._tokenizer.decode(content_ids, skip_special_tokens=False)
++        if content_text is not None:
++            text += content_text
+ 
+         # Use the same initial boundary for extraction and tool scanning.
+         # Preserve whitespace inside reasoning and after its close: templates
+diff --git a/renderers/parsers.py b/renderers/parsers.py
+index 92c66cd11d314119bffff986398853e507f14817..6d9a8c41a72b92783eb5b8db7836e05021f5d428 100644
+--- a/renderers/parsers.py
++++ b/renderers/parsers.py
+@@ -19,8 +19,11 @@ import json
+ import re
+ from typing import Protocol, runtime_checkable
+ 
+-from renderers.base import ParsedToolCall, ToolCallParseStatus
+-
++from renderers.base import (
++    ParsedToolCall,
++    ToolCallParseStatus,
++    _infer_offsets_from_decode,
++)
+ 
+ # ── Shared helpers ───────────────────────────────────────────────────
+ 
+@@ -155,6 +158,90 @@ class Qwen3ToolParser:
+         return content_ids, tool_calls
+ 
+ 
++class HermesToolParser:
++    """Hermes JSON with ordinary, potentially merged delimiter tokens.
++
++    An opener followed by a JSON object or end of output starts an attempt;
++    mentions of the tag in prose stay literal. Text sharing a token with a delimiter is
++    retained by ``extract_text``. Spans cover whole original sampled tokens.
++    """
++
++    def __init__(self, tokenizer):
++        self._tokenizer = tokenizer
++
++    def extract_text(self, ids: list[int]) -> tuple[str, list[ParsedToolCall]]:
++        text = _decode(self._tokenizer, ids)
++        starts = list(re.finditer(r"<tool_call>\s*(?=\{|$)", text))
++        if not starts:
++            return text, []
++        offsets = _infer_offsets_from_decode(self._tokenizer, ids, text)
++        if offsets is None:
++            raise ValueError("Hermes parser cannot map decoded text to sampled tokens")
++        content: list[str] = []
++        calls: list[ParsedToolCall] = []
++        cursor = 0
++        decoder = json.JSONDecoder()
++        for match in starts:
++            if match.start() < cursor:
++                continue
++            payload_start = match.end()
++            parsed = None
++            try:
++                parsed, payload_end = decoder.raw_decode(text, payload_start)
++            except json.JSONDecodeError:
++                payload_end = payload_start
++            # A valid JSON string may itself contain either delimiter.
++            close = text.find("</tool_call>", payload_end)
++            end = len(text) if close == -1 else close + len("</tool_call>")
++            raw = text[payload_start : close if close != -1 else len(text)].strip()
++            name = parsed.get("name") if isinstance(parsed, dict) else None
++            arguments = (
++                parsed.get("arguments", {}) if isinstance(parsed, dict) else None
++            )
++            if close == -1:
++                status = ToolCallParseStatus.UNCLOSED_BLOCK
++            elif parsed is None or text[payload_end:close].strip():
++                status = ToolCallParseStatus.INVALID_JSON
++            elif not isinstance(name, str) or not name:
++                status = ToolCallParseStatus.MISSING_NAME
++            elif not isinstance(arguments, dict):
++                status = ToolCallParseStatus.MALFORMED_STRUCTURE
++            else:
++                status = ToolCallParseStatus.OK
++            start_token = next(
++                i for i, (_, b) in enumerate(offsets) if b > match.start()
++            )
++            end_token = next(
++                (i for i, (a, _) in enumerate(offsets) if a >= end), len(ids)
++            )
++            calls.append(
++                ParsedToolCall(
++                    raw=raw,
++                    name=name if status == ToolCallParseStatus.OK else None,
++                    arguments=arguments,
++                    token_span=(start_token, end_token),
++                    status=status,
++                )
++            )
++            content.append(text[cursor : match.start()])
++            cursor = end
++        content.append(text[cursor:])
++        return "".join(content), calls
++
++    def extract(self, ids: list[int]) -> tuple[list[int], list[ParsedToolCall]]:
++        """Remove whole tokens intersecting calls; never re-encode sampled IDs."""
++        _, calls = self.extract_text(ids)
++        content_ids: list[int] = []
++        cursor = 0
++        for call in calls:
++            assert call.token_span is not None
++            start, end = call.token_span
++            content_ids.extend(ids[cursor:start])
++            cursor = end
++        content_ids.extend(ids[cursor:])
++        return content_ids, calls
++
++
+ class Qwen35ToolParser:
+     """XML-style tool calls: ``<tool_call><function=N><parameter=K>V</parameter>...</function></tool_call>``."""
+ 
+@@ -457,6 +544,7 @@ class ThinkTextReasoningParser:
+ 
+ TOOL_PARSERS: dict[str, type] = {
+     "qwen3": Qwen3ToolParser,
++    "hermes": HermesToolParser,
+     "qwen3.5": Qwen35ToolParser,
+     "glm": GlmToolParser,
+     "deepseek-v3": DeepSeekV3ToolParser,
+diff --git a/tests/test_hermes_parser.py b/tests/test_hermes_parser.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9eb4e9027ff93e7ab8c162b95e099c8531049efb
+--- /dev/null
++++ b/tests/test_hermes_parser.py
+@@ -0,0 +1,301 @@
++"""Hermes parsing against Trinity's pinned tokenizer and actual template."""
++
++import asyncio
++import json
++
++import pytest
++from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
++
++from renderers import DefaultRendererConfig, create_renderer
++from renderers.base import (
++    RenderedConversation,
++    ToolCallParseStatus,
++    build_training_sample,
++)
++from renderers.parsers import get_tool_parser
++
++
++@pytest.fixture(scope="module")
++def trinity():
++    return PreTrainedTokenizerFast.from_pretrained(
++        "arcee-ai/Trinity-Mini",
++        revision="cdb81e8130815fec299cccc8f8700004b8366e1e",
++    )
++
++
++def encode(tok, text):
++    return tok.encode(text, add_special_tokens=False)
++
++
++def test_hermes_template_roundtrip_and_training_mask(trinity):
++    renderer = create_renderer(
++        trinity, DefaultRendererConfig(tool_parser="hermes", reasoning_parser="think")
++    )
++    messages = [
++        {"role": "user", "content": "search"},
++        {
++            "role": "assistant",
++            "content": "",
++            "tool_calls": [
++                {
++                    "id": "call_a",
++                    "type": "function",
++                    "function": {"name": "search", "arguments": '{"q":"rain"}'},
++                },
++                {
++                    "id": "call_b",
++                    "type": "function",
++                    "function": {"name": "lookup", "arguments": '{"n":2}'},
++                },
++            ],
++        },
++    ]
++    full = renderer.render_ids(messages)
++    prompt = encode(
++        trinity,
++        trinity.apply_chat_template(messages[:1], tokenize=False)
++        + "<|im_start|>assistant\n",
++    )
++    split = next(
++        (i for i, (a, b) in enumerate(zip(prompt, full)) if a != b), len(prompt)
++    )
++    prompt = full[:split]
++    completion = full[split:]
++    original = list(completion)
++    parsed = renderer.parse_response(completion)
++    assert [(tc.name, tc.arguments, tc.status, tc.id) for tc in parsed.tool_calls] == [
++        ("search", {"q": "rain"}, ToolCallParseStatus.OK, None),
++        ("lookup", {"n": 2}, ToolCallParseStatus.OK, None),
++    ]
++    # The template does not carry wire IDs; callers allocate those IDs.
++    rebuilt = dict(
++        messages[1],
++        tool_calls=[
++            {
++                "type": "function",
++                "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
++            }
++            for tc in parsed.tool_calls
++        ],
++    )
++    assert renderer.render_ids([messages[0], rebuilt]) == full
++    logprobs = [-i / 100 for i in range(len(completion))]
++    state = RenderedConversation(prompt_ids=prompt).with_completion(
++        completion, completion_logprobs=logprobs, parsed_completion=parsed
++    )
++    assert state.token_ids == full
++    assert state.completion_logprobs == logprobs
++    sample = build_training_sample(
++        renderer, messages, role_to_mask=lambda m: m["role"] == "assistant"
++    )
++    assert sample.token_ids == full
++    user_length = len(renderer.render_ids(messages[:1]))
++    assert sample.loss_mask == [False] * user_length + [True] * (
++        len(full) - user_length
++    )
++    assert len(sample.loss_mask) == len(full)
++    assert all(sample.loss_mask[len(prompt) :])
++    assert completion == original
++
++
++@pytest.mark.parametrize(
++    "prefix,suffix", [("before\n", "\nafter"), ("x", "tail"), ("", "\n")]
++)
++def test_hermes_merged_boundaries_and_interleaved_text(trinity, prefix, suffix):
++    renderer = create_renderer(
++        trinity, DefaultRendererConfig(tool_parser="hermes", reasoning_parser="think")
++    )
++    first = '<tool_call>{"name":"f","arguments":{"s":"</tool_call><tool_call>"}}</tool_call>'
++    second = '<tool_call>\n{"name":"g","arguments":{}}\n</tool_call>'
++    text = prefix + first + " middle " + second + suffix
++    ids = encode(trinity, text)
++    parsed = renderer.parse_response(ids)
++    assert parsed.content == prefix + " middle " + suffix
++    assert [tc.name for tc in parsed.tool_calls] == ["f", "g"]
++    assert all(tc.status == ToolCallParseStatus.OK for tc in parsed.tool_calls)
++    assert parsed.tool_calls[0].arguments == {"s": "</tool_call><tool_call>"}
++    for tc, block in zip(parsed.tool_calls, [first, second]):
++        start, end = tc.token_span
++        assert block in trinity.decode(ids[start:end])
++        # Selective masks index the emitted stream, including merged boundary tokens.
++        mask = [True] * len(ids)
++        mask[start:end] = [False] * (end - start)
++        assert len(mask) == len(ids)
++        assert sum(not value for value in mask) == end - start
++
++
++@pytest.mark.parametrize(
++    "body,status",
++    [
++        ('{"name":"f","arguments":{}}', ToolCallParseStatus.OK),
++        ("{broken", ToolCallParseStatus.INVALID_JSON),
++        ('{"arguments":{}}', ToolCallParseStatus.MISSING_NAME),
++        ('{"name":23,"arguments":{}}', ToolCallParseStatus.MISSING_NAME),
++        ('{"name":"f","arguments":[]}', ToolCallParseStatus.MALFORMED_STRUCTURE),
++    ],
++)
++def test_hermes_attempt_status(trinity, body, status):
++    parser = get_tool_parser("hermes", trinity)
++    ids = encode(trinity, "<tool_call>\n" + body + "\n</tool_call>")
++    content, calls = parser.extract(ids)
++    assert content == []
++    assert len(calls) == 1
++    assert calls[0].status == status
++    if status != ToolCallParseStatus.OK:
++        assert calls[0].name is None
++    assert calls[0].token_span == (0, len(ids))
++
++
++@pytest.mark.parametrize(
++    "text",
++    [
++        "plain reply",
++        "Use <tool_call> and </tool_call> tags.",
++        "<tool_cal",
++        "</tool_call>",
++        "<tool_call>...",
++    ],
++)
++def test_hermes_literal_and_partial_tags(trinity, text):
++    ids = encode(trinity, text)
++    assert get_tool_parser("hermes", trinity).extract(ids) == (ids, [])
++
++
++def test_hermes_reasoning_unclosed_and_no_tools(trinity):
++    renderer = create_renderer(
++        trinity, DefaultRendererConfig(tool_parser="hermes", reasoning_parser="think")
++    )
++    plain = '<think>consider <tool_call>{"name":"literal"}</tool_call></think>reply'
++    parsed = renderer.parse_response(encode(trinity, plain), tools=None)
++    assert parsed.content == "reply"
++    assert (
++        parsed.reasoning_content == 'consider <tool_call>{"name":"literal"}</tool_call>'
++    )
++    assert parsed.tool_calls == []
++    text = '<think>reason</think>before<tool_call>{"name":"f"}</tool_cal'
++    ids = encode(trinity, text)
++    parsed = renderer.parse_response(ids)
++    assert parsed.reasoning_content == "reason"
++    assert parsed.content == "before"
++    assert parsed.tool_calls[0].status == ToolCallParseStatus.UNCLOSED_BLOCK
++    start, end = parsed.tool_calls[0].token_span
++    assert "<tool_call>" in trinity.decode(ids[start:end])
++    assert end == len(ids)
++    prompt = encode(trinity, "<|im_start|>assistant\n<think>\n")
++    parsed = renderer.parse_response(
++        encode(trinity, "reason</think>reply"), prompt_ids=prompt
++    )
++    assert parsed.reasoning_content == "reason"
++    assert parsed.content == "reply"
++
++
++@pytest.mark.parametrize("text", ["<tool_call>", "<tool_call>\n"])
++def test_hermes_empty_unclosed_attempt(trinity, text):
++    ids = encode(trinity, text)
++    content, calls = get_tool_parser("hermes", trinity).extract(ids)
++    assert content == []
++    assert calls[0].status == ToolCallParseStatus.UNCLOSED_BLOCK
++    assert calls[0].token_span == (0, len(ids))
++
++
++def test_hermes_native_generate_then_tool_result(trinity):
++    asyncio.run(_hermes_native_generate_then_tool_result(trinity))
++
++
++async def _hermes_native_generate_then_tool_result(trinity):
++    from test_client import _FakeClient
++
++    from renderers.client import generate
++
++    renderer = create_renderer(
++        trinity, DefaultRendererConfig(tool_parser="hermes", reasoning_parser="think")
++    )
++    tools = [
++        {
++            "type": "function",
++            "function": {
++                "name": "search",
++                "parameters": {"type": "object", "properties": {}},
++            },
++        }
++    ]
++    messages = [{"role": "user", "content": "search"}]
++    completion = encode(
++        trinity,
++        'reason</think>\n<tool_call>\n{"name": "search", "arguments": {}}\n</tool_call><|im_end|>',
++    )
++    logprobs = [-i / 100 for i in range(len(completion))]
++    client = _FakeClient()
++    client.choice.update(
++        token_ids=completion,
++        logprobs={
++            "content": [
++                {"token": f"token_id:{token}", "logprob": logprob}
++                for token, logprob in zip(completion, logprobs)
++            ]
++        },
++    )
++    first = await generate(
++        client=client,
++        renderer=renderer,
++        messages=messages,
++        tools=tools,
++        model="trinity",
++        max_prompt_len=10000,
++    )
++    assert first["completion_ids"] == completion
++    assert first["completion_logprobs"] == logprobs
++    assert first["reasoning_content"] == "reason"
++    assert first["finish_reason"] == "tool_calls"
++    call = first["tool_calls"][0]
++    assert call.name == "search"
++    assistant = {
++        "role": "assistant",
++        "content": first["content"],
++        "reasoning_content": first["reasoning_content"],
++        "tool_calls": [
++            {
++                "id": "call_0",
++                "type": "function",
++                "function": {
++                    "name": call.name,
++                    "arguments": json.dumps(call.arguments),
++                },
++            }
++        ],
++    }
++    tail = [{"role": "tool", "tool_call_id": "call_0", "content": "found"}]
++    assert (
++        renderer.bridge_to_next_turn(first["prompt_ids"], completion, tail, tools=tools)
++        is None
++    )
++    client.choice.update(token_ids=encode(trinity, "done</think>reply<|im_end|>"))
++    client.choice["logprobs"] = {
++        "content": [
++            {"token": f"token_id:{token}", "logprob": -0.1}
++            for token in client.choice["token_ids"]
++        ]
++    }
++    second = await generate(
++        client=client,
++        renderer=renderer,
++        messages=messages + [assistant] + tail,
++        tools=tools,
++        model="trinity",
++        max_prompt_len=10000,
++    )
++    prior = first["prompt_ids"] + completion
++    prefix = next(
++        (i for i, (a, b) in enumerate(zip(prior, second["prompt_ids"])) if a != b),
++        min(len(prior), len(second["prompt_ids"])),
++    )
++    # The opaque template strips historical reasoning: native fallback must
++    # retain each turn as its own sampled segment, not claim a shared prefix.
++    assert prefix < len(first["prompt_ids"])
++    assert first["completion_ids"] == completion
++    assert first["completion_logprobs"] == logprobs
++    assert second["content"] == "reply"
++    assert second["prompt_attribution"].sampled_mask == []
++    print(
++        f"native first_prompt={len(first['prompt_ids'])} completion={len(completion)} next_prompt={len(second['prompt_ids'])} shared_prefix={prefix}"
++    )
