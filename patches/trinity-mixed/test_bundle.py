@@ -61,6 +61,20 @@ def run_bundle(assembly, *args):
     )
 
 
+def state(assembly):
+    root, _, dependencies = assembly
+    return [
+        (
+            git(repo, "rev-parse", "HEAD"),
+            git(repo, "write-tree"),
+            git(repo, "diff", "--binary", "--full-index"),
+            git(repo, "status", "--porcelain"),
+        )
+        for dependency in dependencies
+        for repo in [root / "deps" / dependency["name"]]
+    ]
+
+
 def test_fresh_apply_check_and_idempotence(assembly):
     root, _, dependencies = assembly
     result = run_bundle(assembly)
@@ -78,71 +92,81 @@ def test_fresh_apply_check_and_idempotence(assembly):
         assert git(repo, "write-tree") == git(repo, "rev-parse", f"{dependency['target']}^{{tree}}")
 
 
+@pytest.mark.parametrize("name", ["renderers", "verifiers"])
 @pytest.mark.parametrize("fault", ["wrong_base", "corrupt_patch", "unstaged", "staged", "untracked"])
-def test_rejects_fault_before_changing_either_dependency(assembly, fault):
+def test_rejects_fault_before_changing_either_dependency(assembly, fault, name):
     root, bundle, dependencies = assembly
-    first = root / "deps" / "renderers"
-    second = root / "deps" / "verifiers"
+    repo = root / "deps" / name
+    dependency = next(item for item in dependencies if item["name"] == name)
     if fault == "wrong_base":
-        git(second, "checkout", dependencies[1]["target"])
+        git(repo, "checkout", dependency["target"])
     elif fault == "corrupt_patch":
-        with (bundle / "verifiers.patch").open("ab") as output:
+        with (bundle / dependency["patch"]).open("ab") as output:
             output.write(b"corrupt")
     elif fault == "untracked":
-        (second / "unexpected").write_text("untracked")
+        (repo / "unexpected").write_text("untracked")
     else:
-        (second / "content").write_text("unexpected change")
+        (repo / "content").write_text("unexpected change")
         if fault == "staged":
-            git(second, "add", "content")
-    before = git(second, "status", "--porcelain")
+            git(repo, "add", "content")
+    before = state(assembly)
     result = run_bundle(assembly, "--apply")
     assert result.returncode != 0
-    assert git(first, "status", "--porcelain") == b""
-    assert git(second, "status", "--porcelain") == before
+    assert state(assembly) == before
 
 
-@pytest.fixture
-def upgrade_assembly(assembly):
+@pytest.fixture(params=[0, 1], ids=["current", "legacy"])
+def upgrade_assembly(assembly, request):
     root, bundle, dependencies = assembly
     dependency = dependencies[1]
     repo = root / "deps" / "verifiers"
-    old_patch = (bundle / "verifiers.patch").read_bytes()
-    old_target = dependency["target"]
-    old_sha = dependency["sha256"]
-    git(repo, "checkout", old_target)
+    legacy_target = dependency["target"]
+    git(repo, "checkout", legacy_target)
+    (repo / "content").write_bytes(b"current\x00data")
+    current_target = commit(repo, "current")
     (repo / "content").write_bytes(b"upgraded\x00data")
     target = commit(repo, "upgraded")
     patch = git(repo, "diff", "--binary", "--full-index", dependency["base"], target)
-    incremental = git(repo, "diff", "--binary", "--full-index", old_target, target)
     (bundle / "verifiers.patch").write_bytes(patch)
-    (bundle / "verifiers-upgrade.patch").write_bytes(incremental)
     dependency.update(
         target=target,
         sha256=hashlib.sha256(patch).hexdigest(),
-        upgrade={
-            "from_target": old_target,
-            "from_sha256": old_sha,
-            "patch": "verifiers-upgrade.patch",
-            "sha256": hashlib.sha256(incremental).hexdigest(),
-        },
+        upgrades=[],
     )
+    old_patches = []
+    for old_target, filename in [
+        (current_target, "verifiers-upgrade.patch"),
+        (legacy_target, f"verifiers-upgrade-{legacy_target[:7]}.patch"),
+    ]:
+        incremental = git(repo, "diff", "--binary", "--full-index", old_target, target)
+        (bundle / filename).write_bytes(incremental)
+        old_patch = git(repo, "diff", "--binary", "--full-index", dependency["base"], old_target)
+        old_patches.append(old_patch)
+        dependency["upgrades"].append(
+            {
+                "from_target": old_target,
+                "from_sha256": hashlib.sha256(old_patch).hexdigest(),
+                "patch": filename,
+                "sha256": hashlib.sha256(incremental).hexdigest(),
+            }
+        )
     (bundle / "manifest.json").write_text(json.dumps({"version": 1, "dependencies": dependencies}))
     git(repo, "checkout", dependency["base"])
-    subprocess.run(["git", "-C", str(repo), "apply", "--index", "-"], input=old_patch, check=True)
+    subprocess.run(["git", "-C", str(repo), "apply", "--index", "-"], input=old_patches[request.param], check=True)
     return assembly
 
 
 def test_upgrade_requires_opt_in_and_is_idempotent(upgrade_assembly):
     root, _, dependencies = upgrade_assembly
     repo = root / "deps" / "verifiers"
-    before = git(repo, "write-tree")
+    before = state(upgrade_assembly)
     assert run_bundle(upgrade_assembly, "--apply").returncode != 0
     assert git(root / "deps" / "renderers", "status", "--porcelain") == b""
-    assert git(repo, "write-tree") == before
+    assert state(upgrade_assembly) == before
     result = run_bundle(upgrade_assembly, "--upgrade")
     assert result.returncode == 0, result.stderr
     assert "PASS (upgrade ready)" in result.stdout
-    assert git(repo, "write-tree") == before
+    assert state(upgrade_assembly) == before
     for args in [("--upgrade", "--apply"), (), ("--upgrade", "--apply")]:
         result = run_bundle(upgrade_assembly, *args)
         assert result.returncode == 0, result.stderr
@@ -153,22 +177,21 @@ def test_upgrade_requires_opt_in_and_is_idempotent(upgrade_assembly):
 
 @pytest.mark.parametrize("fault", ["altered_old", "untracked", "unstaged", "wrong_base", "corrupt_incremental"])
 def test_upgrade_rejects_unexpected_state_before_writes(upgrade_assembly, fault):
-    root, bundle, _ = upgrade_assembly
+    root, bundle, dependencies = upgrade_assembly
     repo = root / "deps" / "verifiers"
     if fault == "wrong_base":
         commit(repo, "wrong base")
     elif fault == "corrupt_incremental":
-        with (bundle / "verifiers-upgrade.patch").open("ab") as output:
-            output.write(b"corrupt")
+        for upgrade in dependencies[1]["upgrades"]:
+            with (bundle / upgrade["patch"]).open("ab") as output:
+                output.write(b"corrupt")
     elif fault == "untracked":
         (repo / "unrelated").write_text("untracked")
     else:
         (repo / "content").write_text("unexpected")
         if fault == "altered_old":
             git(repo, "add", "content")
-    before_tree = git(repo, "write-tree")
-    before_status = git(repo, "status", "--porcelain")
+    before = state(upgrade_assembly)
     assert run_bundle(upgrade_assembly, "--upgrade", "--apply").returncode != 0
     assert git(root / "deps" / "renderers", "status", "--porcelain") == b""
-    assert git(repo, "write-tree") == before_tree
-    assert git(repo, "status", "--porcelain") == before_status
+    assert state(upgrade_assembly) == before

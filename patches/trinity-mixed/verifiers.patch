@@ -196,6 +196,107 @@ index 42710cd39112fee39a9d7fb836de953136cc62e0..556a065e2005070e28e2186679a5e6d8
      max_total_tokens: int | None = None
      """Max total tokens per run (None = no limit)."""
      max_turn_tokens: int | None = Field(None, gt=0)
+diff --git a/verifiers/v1/configs/harness.py b/verifiers/v1/configs/harness.py
+index 77d6cbad1bb65de4ce5add01cb982e506a97519c..75364ded2eb06be6c4df16e3c2277cdb479a3cf8 100644
+--- a/verifiers/v1/configs/harness.py
++++ b/verifiers/v1/configs/harness.py
+@@ -50,7 +50,7 @@ class HarnessConfig(BaseConfig):
+         return resolved
+ 
+     tool_timeout: FiniteFloat = Field(600.0, gt=0)
+-    """Seconds a single MCP tool call may take; raise it for tools that boot a VM."""
++    """Seconds a single MCP or native Bash tool call may take; raise it for tools that boot a VM."""
+     disabled_tools: list[str] | None = None
+     dialect: DialectName | Literal["auto"] = "auto"
+     """Model API wire format the program speaks. `auto` lets the program pick, e.g. from
+diff --git a/verifiers/v1/harnesses/bash/harness.py b/verifiers/v1/harnesses/bash/harness.py
+index d69f90a4e5b1d4c92f60ac9172f3ced951949659..c3476474051e25a9022d471a995e10c3e9d66589 100644
+--- a/verifiers/v1/harnesses/bash/harness.py
++++ b/verifiers/v1/harnesses/bash/harness.py
+@@ -87,7 +87,7 @@ class BashHarness(Harness[BashHarnessConfig]):
+         ):
+             system_prompt = None
+         env = {**self.config.resolved_env}
+-        args = ["--bash"]
++        args = ["--bash", f"--bash-timeout={self.config.tool_timeout}"]
+         if tool_interception_url:
+             args.append(f"--tool-interception-url={tool_interception_url}")
+         args += compaction_args(self.config.compaction)
+diff --git a/verifiers/v1/harnesses/utils/core.py b/verifiers/v1/harnesses/utils/core.py
+index 6b48d3b6fdd6a1ce8e2b24ad51d78544b57d4e0f..f9a8aae061a66b5c1374d9d928e30ef5543a0ba8 100644
+--- a/verifiers/v1/harnesses/utils/core.py
++++ b/verifiers/v1/harnesses/utils/core.py
+@@ -4,6 +4,9 @@ import argparse
+ import asyncio
+ import json
+ import logging
++import math
++import os
++import signal
+ import subprocess
+ import traceback
+ from contextlib import AsyncExitStack
+@@ -157,16 +160,34 @@ def run_search(query: str, api_key: str, num_results: int = 5) -> str:
+         return f"search failed ({e}). Try again or rephrase the query."
+ 
+ 
+-def run_bash(command: str) -> str:
++def positive_timeout(value: str | float) -> float:
++    timeout = float(value)
++    if not math.isfinite(timeout) or timeout <= 0:
++        raise ValueError("timeout must be positive and finite")
++    return timeout
++
++
++def run_bash(command: str, timeout: float = 3600) -> str:
+     try:
+-        result = subprocess.run(
++        timeout = positive_timeout(timeout)
++        with subprocess.Popen(
+             ["bash", "-c", command],
+-            capture_output=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
+             text=True,
+-            timeout=3600,
+-            check=False,
+-        )
+-        return result.stdout + result.stderr
++            start_new_session=True,
++        ) as process:
++            try:
++                stdout, stderr = process.communicate(timeout=timeout)
++            except subprocess.TimeoutExpired:
++                # Stop the shell's children too, including those holding output pipes.
++                try:
++                    os.killpg(process.pid, signal.SIGKILL)
++                except ProcessLookupError:
++                    pass
++                process.wait()
++                raise
++        return stdout + stderr
+     except Exception as e:  # noqa: BLE001 - tool failures are returned to the model
+         return f"error: {e}"
+ 
+@@ -412,7 +433,9 @@ async def run_chat_loop(
+                     content = await call_mcp(servers, dispatch, name, tool_args)
+                 elif name == "bash" and args.bash:
+                     content = await asyncio.to_thread(
+-                        run_bash, tool_args.get("command", "")
++                        run_bash,
++                        tool_args.get("command", ""),
++                        getattr(args, "bash_timeout", 3600),
+                     )
+                 elif name == "edit" and args.edit:
+                     content = await asyncio.to_thread(
+@@ -450,6 +473,7 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--mcp-config", default="")
+     parser.add_argument("--tool-interception-url", default="")
+     parser.add_argument("--bash", action="store_true")
++    parser.add_argument("--bash-timeout", type=positive_timeout, default=3600.0)
+     parser.add_argument("--compaction", action="store_true")
+     parser.add_argument("--summarize-at-tokens", type=int)
+     parser.add_argument("--edit", action="store_true")
 diff --git a/verifiers/v1/interception/server.py b/verifiers/v1/interception/server.py
 index fa04f6e30699c3d93a8b59ed5cb1e8016351b864..e1eb6fdeaf985765976daee5b935ed01bca577b1 100644
 --- a/verifiers/v1/interception/server.py

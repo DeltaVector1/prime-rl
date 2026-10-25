@@ -48,9 +48,10 @@ def check(repo_root: Path, bundle: Path, dependency: dict, *, allow_upgrade: boo
     if staged:
         if digest(staged) == dependency["sha256"]:
             return repo, patch, "applied"
-        upgrade = dependency.get("upgrade") if allow_upgrade else None
-        if upgrade is not None and digest(staged) == upgrade["from_sha256"]:
-            if upgrade["patch"] != f"{name}-upgrade.patch":
+        for upgrade in dependency.get("upgrades", []) if allow_upgrade else []:
+            if digest(staged) != upgrade["from_sha256"]:
+                continue
+            if upgrade["patch"] not in {f"{name}-upgrade.patch", f"{name}-upgrade-{upgrade['from_target'][:7]}.patch"}:
                 raise ValueError(f"{name}: invalid upgrade patch name")
             patch = bundle / upgrade["patch"]
             if digest(patch.read_bytes()) != upgrade["sha256"]:

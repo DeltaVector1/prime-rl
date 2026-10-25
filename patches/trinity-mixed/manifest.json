@@ -12,22 +12,30 @@
     {
       "name": "verifiers",
       "base": "2f6ed0ce6e04e26b713801a3e701e857b6f36452",
-      "target": "412a8c07c82077a26317930a2cab7e708f86b6e3",
+      "target": "35ac62a8a426ac02964405723d708133aac0445d",
       "patch": "verifiers.patch",
-      "sha256": "cf8c65272f9b212b5015f67f3fd2d79ba780f1461af785a392852cc418e4bd2a",
-      "reviewer_diff_sha256": "e0a0f2a9fe686b92b2f86ebfc90c4a08279bbd7f9c16ec62b0fd3d20be8da378",
-      "upgrade": {
-        "from_target": "073d7f1c3b1307343adc3e7db049aa61423c07f0",
-        "from_sha256": "2fc191bb7340ae23669daac2bb1485c2cfa18b558e3c52b40c42494a915c8984",
-        "patch": "verifiers-upgrade.patch",
-        "sha256": "df8196ac88bbe4669b4f73824fec14d6e14cbd74c59ed23605e9603009e69bd2"
-      }
+      "sha256": "e338d0749ed0b1ee56a4ef6102fde4238cbc62e1d4e9cd5355177ac9fdefa469",
+      "reviewer_diff_sha256": "d6b93a732f28ea34f5b8c2ad95479e67a2ec2b22974bbf625d69be886ba407f7",
+      "upgrades": [
+        {
+          "from_target": "412a8c07c82077a26317930a2cab7e708f86b6e3",
+          "from_sha256": "cf8c65272f9b212b5015f67f3fd2d79ba780f1461af785a392852cc418e4bd2a",
+          "patch": "verifiers-upgrade.patch",
+          "sha256": "5e0bd4e2160b3c1965fbc7ed68532bb7c4fa6440c557fe7aaa707390eb33e724"
+        },
+        {
+          "from_target": "073d7f1c3b1307343adc3e7db049aa61423c07f0",
+          "from_sha256": "2fc191bb7340ae23669daac2bb1485c2cfa18b558e3c52b40c42494a915c8984",
+          "patch": "verifiers-upgrade-073d7f1.patch",
+          "sha256": "67c089c9d7c57b2dc0c55ae57411b0a6a1107352785bf01cb0513c90dc20d983"
+        }
+      ]
     }
   ],
   "install_contract": [
     "Run native frozen sync while preserving editable dependencies at their upstream base gitlinks.",
     "Check this bundle against the explicit native repository root, then apply it and check again.",
-    "For the exact previously staged verifier bundle, run apply.py --repo-root /explicit/native/root --upgrade to check, then add --apply to upgrade. Finish with the default check. Both dependencies are checked before changes; no reset, stash, or cleanup is used.",
+    "For either exact previously staged verifier bundle (412a8c0 or 073d7f1), run apply.py --repo-root /explicit/native/root --upgrade to check, then add --apply to upgrade. Finish with the default check. Both dependencies are checked before changes; no reset, stash, or cleanup is used.",
     "Install ported Xiaomi wheels with --no-deps. Xiaomi toolkit reference commit: 10216e63f9bc78a053f253bd4fbf2e0b45481a84; toolkit is not bundled here.",
     "Run the native runtime with --no-sync. Do not run a normal Xiaomi uv sync that replaces the native dependency pins."
   ]
