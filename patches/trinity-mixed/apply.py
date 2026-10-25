@@ -18,7 +18,7 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def check(repo_root: Path, bundle: Path, dependency: dict) -> tuple[Path, Path, str]:
+def check(repo_root: Path, bundle: Path, dependency: dict, *, allow_upgrade: bool = False) -> tuple[Path, Path, str]:
     name = dependency["name"]
     if name not in {"renderers", "verifiers"} or dependency["patch"] != f"{name}.patch":
         raise ValueError(f"Invalid dependency entry: {name}")
@@ -46,9 +46,18 @@ def check(repo_root: Path, bundle: Path, dependency: dict) -> tuple[Path, Path, 
         "HEAD",
     )
     if staged:
-        if digest(staged) != dependency["sha256"]:
-            raise ValueError(f"{name}: unexpected staged diff")
-        return repo, patch, "applied"
+        if digest(staged) == dependency["sha256"]:
+            return repo, patch, "applied"
+        upgrade = dependency.get("upgrade") if allow_upgrade else None
+        if upgrade is not None and digest(staged) == upgrade["from_sha256"]:
+            if upgrade["patch"] != f"{name}-upgrade.patch":
+                raise ValueError(f"{name}: invalid upgrade patch name")
+            patch = bundle / upgrade["patch"]
+            if digest(patch.read_bytes()) != upgrade["sha256"]:
+                raise ValueError(f"{name}: upgrade patch hash mismatch")
+            git(repo, "apply", "--check", "--index", str(patch))
+            return repo, patch, "upgrade ready"
+        raise ValueError(f"{name}: unexpected staged diff")
     git(repo, "apply", "--check", "--index", str(patch))
     return repo, patch, "ready"
 
@@ -57,6 +66,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, required=True)
     parser.add_argument("--apply", action="store_true", help="Apply and stage both verified patches")
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Accept the manifest's exact old staged bundle; use --apply to upgrade it",
+    )
     args = parser.parse_args()
     repo_root = args.repo_root.resolve()
     if Path(git(repo_root, "rev-parse", "--show-toplevel").decode().strip()) != repo_root:
@@ -69,9 +83,9 @@ def main() -> None:
     if sorted(item["name"] for item in dependencies) != ["renderers", "verifiers"]:
         raise ValueError("Expected exactly renderers and verifiers")
     # Check both repositories and patch hashes before modifying either repository.
-    states = [check(repo_root, bundle, dependency) for dependency in dependencies]
+    states = [check(repo_root, bundle, dependency, allow_upgrade=args.upgrade) for dependency in dependencies]
     for dependency, (repo, patch, status) in zip(dependencies, states, strict=True):
-        if args.apply and status == "ready":
+        if args.apply and status in {"ready", "upgrade ready"}:
             git(repo, "apply", "--index", str(patch))
             _, _, status = check(repo_root, bundle, dependency)
             if status != "applied":

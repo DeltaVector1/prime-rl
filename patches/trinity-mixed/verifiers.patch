@@ -239,6 +239,54 @@ index fa04f6e30699c3d93a8b59ed5cb1e8016351b864..e1eb6fdeaf985765976daee5b935ed01
                              headers=upstream_headers,
                              session_id=session.trace.id,
                              turn=turn,
+diff --git a/verifiers/v1/mcp/launch.py b/verifiers/v1/mcp/launch.py
+index 1d29f78c33d69c34a0a6b86050ee6b750d6dec0a..8a661440259c4b59ef7873882296e7a5f730a339 100644
+--- a/verifiers/v1/mcp/launch.py
++++ b/verifiers/v1/mcp/launch.py
+@@ -345,6 +345,29 @@ async def serve_in_runtime(
+     the OS choose and report the result through a file. With a state channel, the server fetches
+     the current rollout task from the adjacent `/task` endpoint rather than a launch argument.
+     """
++    if (user := getattr(server.config, "user", None)) is not None:
++        # Bind only execution here: _serve retains the placement runtime's identity
++        # when deciding whether the harness needs a forwarded or colocated URL.
++        runtime = runtime.with_user(user)
++        lookup = await runtime.run(
++            [
++                "sh",
++                "-c",
++                (
++                    "tool_user_home=$(awk -F: -v u=\"$1\" '$1 == u { print $6 }' /etc/passwd); "
++                    'echo "$tool_user_home"; test -n "$tool_user_home" && test -d "$tool_user_home"'
++                ),
++                "sh",
++                user,
++            ],
++            {},
++        )
++        home = lookup.stdout.strip()
++        if lookup.exit_code != 0 or not home:
++            raise ToolsetError(
++                f"server {server.server_name!r}: user {user!r} has no home directory"
++            )
++        runtime = runtime.with_user(user, home=home)
+     # A shared server has a private service secret but no fixed state URL. Set
+     # both controls explicitly so a subprocess cannot inherit stale host values.
+     env = {
+diff --git a/verifiers/v1/mcp/toolset.py b/verifiers/v1/mcp/toolset.py
+index cb4fdaee77ef2328e40a9db5d8f6b57adfaea1bd..1e7f53fe219ad99e0f79c1b8c59624e1fab42513 100644
+--- a/verifiers/v1/mcp/toolset.py
++++ b/verifiers/v1/mcp/toolset.py
+@@ -16,6 +16,9 @@ if TYPE_CHECKING:
+ 
+ class ToolsetConfig(BaseConfig):
+     colocated: bool = False
++    user: str | None = None
++    """Run the server as this existing runtime user, with its home directory.
++    None inherits the placement runtime's user (the agent for colocated tools)."""
+     runtime: RuntimeConfig = SubprocessConfig()
+     """Where the server runs: the evaluator by default. A Prime runtime beside a Prime
+     workspace without Compose services is a VM of the server's own that joins the
 diff --git a/verifiers/v1/session.py b/verifiers/v1/session.py
 index 1e7a0551fedcd3ef0259127186a4fe26c4ac5507..841e1ab84c096aa9cd4cb9b88916b3a6f4f796f3 100644
 --- a/verifiers/v1/session.py
