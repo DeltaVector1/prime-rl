@@ -95,6 +95,78 @@ def test_curriculum_requires_unique_finite_task_keys() -> None:
         StandardSampler([task, task])
 
 
+@pytest.fixture
+def make_train_source():
+    def make(names: list[str], *, streaming: bool = False) -> TrainSource:
+        return TrainSource(
+            [
+                SimpleNamespace(
+                    name=name,
+                    tasks=iter([make_task(i) for i in range(20)]),
+                    num_tasks=None if streaming else 20,
+                    config=SimpleNamespace(ratio=1.0, curriculum=None),
+                )
+                for name in names
+            ]
+        )
+
+    return make
+
+
+def test_train_source_rejects_added_env_by_default(make_train_source) -> None:
+    source = make_train_source(["decensor"])
+    restored = make_train_source(["decensor", "xiaomi"])
+    initial = restored.state_dict()
+    with pytest.raises(ValueError, match="do not match configured envs"):
+        restored.load_state_dict(source.state_dict())
+    assert restored.state_dict() == initial
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_train_source_allows_added_env_with_saved_cursor_and_rng(make_train_source, streaming: bool) -> None:
+    source = make_train_source(["decensor"], streaming=streaming)
+    for _ in range(7):
+        source.next_task(step=100)
+    saved = source.state_dict()
+    restored = make_train_source(["xiaomi", "decensor"], streaming=streaming)
+    initial_xiaomi = restored.curricula["xiaomi"].state_dict()
+    restored.load_state_dict(saved, allow_new_envs=True)
+
+    assert restored.rng.getstate() == saved["rng"]
+    assert restored.curricula["decensor"].state_dict() == saved["envs"]["decensor"]
+    assert restored.curricula["decensor"].state_dict()["sampler"]["cursor"] == 7
+    assert restored.curricula["xiaomi"].state_dict() == initial_xiaomi
+    assert initial_xiaomi["sampler"]["cursor"] == 0
+    assert next(restored.curricula["decensor"].sampler).key == next(source.curricula["decensor"].sampler).key
+    assert next(restored.curricula["xiaomi"].sampler).key == make_task(0).key
+    assert restored.rng.random() == source.rng.random()
+
+
+@pytest.mark.parametrize("configured", [["decensor"], ["decensor", "renamed"]])
+def test_train_source_rejects_removed_or_renamed_env_with_opt_in(make_train_source, configured: list[str]) -> None:
+    source = make_train_source(["decensor", "xiaomi"])
+    source.next_task(step=100)
+    restored = make_train_source(configured)
+    initial = restored.state_dict()
+    with pytest.raises(ValueError, match="do not match configured envs"):
+        restored.load_state_dict(source.state_dict(), allow_new_envs=True)
+    assert restored.state_dict() == initial
+
+
+@pytest.mark.parametrize("allow_new_envs", [False, True])
+def test_train_source_same_env_resume_sequence(make_train_source, allow_new_envs: bool) -> None:
+    source = make_train_source(["decensor", "xiaomi"])
+    for _ in range(7):
+        source.next_task(step=100)
+    restored = make_train_source(["decensor", "xiaomi"])
+    restored.load_state_dict(source.state_dict(), allow_new_envs=allow_new_envs)
+    assert restored.state_dict() == source.state_dict()
+    for _ in range(10):
+        actual = restored.next_task(step=101)
+        expected = source.next_task(step=101)
+        assert (actual.env_name, actual.task.key) == (expected.env_name, expected.task.key)
+
+
 def test_train_source_composes_sampler_and_all_gates_with_state_and_metrics() -> None:
     tasks = [make_task(i) for i in range(3)]
     pools = {"all": DifficultyPoolConfig(threshold=1.0, weight=1.0)}

@@ -26,6 +26,7 @@ from prime_rl.configs.orchestrator import (
 )
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import ResumeConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli, dump_resolved_config
@@ -121,6 +122,17 @@ def test_defaults():
     assert config.nested.weight_decay == 0.01
     assert config.variant.type == "a"
     assert config.variant.alpha == 0.1
+
+
+@pytest.mark.parametrize("allow_new_envs", [False, True])
+def test_resume_allow_new_envs_shared_config(allow_new_envs: bool) -> None:
+    assert ResumeConfig().allow_new_envs is False
+    resumed = RLConfig.model_validate(
+        {"trainer": {}, "orchestrator": {}, "resume": {"step": 100, "allow_new_envs": allow_new_envs}}
+    )
+    assert resumed.resume == resumed.trainer.resume == resumed.orchestrator.resume
+    assert resumed.resume.allow_new_envs is allow_new_envs
+    assert RLConfig.model_validate_json(resumed.model_dump_json()).resume == resumed.resume
 
 
 def test_rl_launcher_config_roundtrip(tmp_path):

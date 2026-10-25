@@ -280,7 +280,13 @@ class Orchestrator:
         if self.resume_step is not None:
             resume = self.config.resume
             resume_path = resume.dir / "orchestrator" if resume is not None and resume.dir is not None else None
-            self.ckpt_manager.load(self.progress, self.train_source, step=self.resume_step, path=resume_path)
+            self.ckpt_manager.load(
+                self.progress,
+                self.train_source,
+                step=self.resume_step,
+                path=resume_path,
+                allow_new_envs=resume.allow_new_envs if resume is not None else False,
+            )
             self.progress.step = self.resume_step + 1
 
         get_logger().info("Waiting for policy inference pool to be ready")

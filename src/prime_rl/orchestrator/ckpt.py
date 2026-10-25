@@ -51,7 +51,15 @@ class CheckpointManager:
             f"Orchestrator checkpoint saved to {ckpt_path} in {format_time(time.perf_counter() - start)}"
         )
 
-    def load(self, progress: Progress, train_source: TrainSource, step: int, path: Path | None = None) -> None:
+    def load(
+        self,
+        progress: Progress,
+        train_source: TrainSource,
+        step: int,
+        path: Path | None = None,
+        *,
+        allow_new_envs: bool = False,
+    ) -> None:
         """``path`` overrides where the checkpoint is read from (an external run's
         ``step_<N>/orchestrator``)."""
         ckpt_path = path if path is not None else self.get_ckpt_path(step)
@@ -66,10 +74,12 @@ class CheckpointManager:
         for key, value in asdict(saved).items():
             if hasattr(progress, key):
                 setattr(progress, key, value)
-        train_source.load_state_dict(state["train_source"])
+        train_source.load_state_dict(state["train_source"], allow_new_envs=allow_new_envs)
         for name in state["train_source"]["envs"]:
             if name in train_source.curricula:
                 get_logger().info(f"Resumed curriculum state for env {name}")
+        for name in sorted(set(train_source.curricula) - set(state["train_source"]["envs"])):
+            get_logger().info(f"Initialized new curriculum state for added env {name}")
         get_logger().debug(f"Orchestrator checkpoint loaded in {format_time(time.perf_counter() - start)}")
 
 

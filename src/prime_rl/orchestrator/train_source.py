@@ -70,16 +70,18 @@ class TrainSource:
             "envs": {name: curriculum.state_dict() for name, curriculum in self.curricula.items()},
         }
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any], *, allow_new_envs: bool = False) -> None:
         expected_fields = {"rng", "envs"}
         if set(state_dict) != expected_fields:
             raise ValueError(f"Train-source checkpoint fields must be {sorted(expected_fields)}")
         env_states = state_dict["envs"]
-        if set(env_states) != set(self.curricula):
+        saved_envs = set(env_states)
+        configured_envs = set(self.curricula)
+        if not saved_envs <= configured_envs or (not allow_new_envs and saved_envs != configured_envs):
             raise ValueError(
                 f"Train-source checkpoint envs {sorted(env_states)} do not match configured envs "
                 f"{sorted(self.curricula)}"
             )
         self.rng.setstate(state_dict["rng"])
-        for name, curriculum in self.curricula.items():
-            curriculum.load_state_dict(env_states[name])
+        for name, env_state in env_states.items():
+            self.curricula[name].load_state_dict(env_state)

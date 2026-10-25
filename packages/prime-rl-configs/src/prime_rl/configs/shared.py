@@ -113,6 +113,9 @@ class ResumeConfig(BaseConfig):
     dir: Path | None = None
     """External checkpoint step directory to resume from (e.g. ``other/run/checkpoints/step_50``) — forks another run's checkpoint into this run. Mutually exclusive with ``step``."""
 
+    allow_new_envs: bool = False
+    """Allow added training environments to start with fresh curricula on resume. All saved environments must remain configured."""
+
     @model_validator(mode="after")
     def validate_step_xor_dir(self):
         if self.step is not None and self.dir is not None:
