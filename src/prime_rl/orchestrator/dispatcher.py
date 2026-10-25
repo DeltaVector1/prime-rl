@@ -156,6 +156,9 @@ class Dispatcher:
         self.policy_clients = policy_clients
         self.train_source = train_source
         self.eval_source = eval_source
+        self.train_source_limits = {
+            env.name: env.config.max_outstanding for env in train_envs or () if env.config.max_outstanding is not None
+        }
         self.max_off_policy_steps = max_off_policy_steps
         self.run_id = run_id
         self.run_name = run_name
@@ -498,26 +501,38 @@ class Dispatcher:
         if envs is None:
             return False
 
+        eligible_envs = None
+        if kind == "train" and self.train_source_limits:
+            counts = self.inflight_by_env
+            eligible_envs = {
+                env.name
+                for env in envs
+                if env.name not in self.train_source_limits
+                or counts.get(("train", env.name), 0) < self.train_source_limits[env.name]
+            }
+
         for gid, group in list(self.groups.items()):
             if group.kind != kind or group.episodes_to_schedule <= 0:
                 continue
+            if eligible_envs is not None and group.env_name not in eligible_envs:
+                continue
             return await self.schedule_group_episode(gid, group)
 
-        fresh = self.next_fresh_group(kind, envs)
+        fresh = self.next_fresh_group(kind, envs, eligible_envs=eligible_envs)
         if fresh is None:
             return False
         gid = fresh.group_id or uuid.uuid4()
         self.groups[gid] = fresh
         return await self.schedule_group_episode(gid, fresh)
 
-    def next_fresh_group(self, kind: WorkKind, envs) -> GroupState | None:
+    def next_fresh_group(self, kind: WorkKind, envs, *, eligible_envs: set[str] | None = None) -> GroupState | None:
         """Pop the next task from the corresponding source and wrap it in
         a ``GroupState``. Returns ``None`` if the source is empty."""
         if kind == "train":
             assert self.train_source is not None
             if self.progress is None:
                 raise RuntimeError("Train dispatch requires progress state")
-            request = self.train_source.next_task(step=self.progress.step)
+            request = self.train_source.next_task(step=self.progress.step, eligible_envs=eligible_envs)
         else:
             assert self.eval_source is not None
             request = self.eval_source.next_task()
