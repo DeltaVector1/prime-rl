@@ -167,6 +167,31 @@ def test_train_source_same_env_resume_sequence(make_train_source, allow_new_envs
         assert (actual.env_name, actual.task.key) == (expected.env_name, expected.task.key)
 
 
+def test_train_source_capacity_filter_preserves_rng_and_resume(make_train_source) -> None:
+    source = make_train_source(["slow", "fast", "other"])
+    source.weights = [16.0, 8.0, 5.0]
+    unrestricted = make_train_source(source.env_names)
+    unrestricted.weights = source.weights
+    for _ in range(30):
+        actual = source.next_task(step=1, eligible_envs=set(source.env_names))
+        expected = unrestricted.next_task(step=1)
+        assert (actual.env_name, actual.task.key) == (expected.env_name, expected.task.key)
+    assert source.state_dict() == unrestricted.state_dict()
+    before = source.state_dict()
+    assert source.next_task(step=1, eligible_envs=set()) is None
+    assert source.state_dict() == before
+
+    restored = make_train_source(source.env_names)
+    restored.weights = source.weights
+    restored.load_state_dict(before)
+    for eligible in [{"fast", "other"}, {"other"}, set(source.env_names)] * 10:
+        actual = restored.next_task(step=2, eligible_envs=eligible)
+        expected = source.next_task(step=2, eligible_envs=eligible)
+        assert actual.env_name in eligible
+        assert (actual.env_name, actual.task.key) == (expected.env_name, expected.task.key)
+    assert restored.state_dict() == source.state_dict()
+
+
 def test_train_source_composes_sampler_and_all_gates_with_state_and_metrics() -> None:
     tasks = [make_task(i) for i in range(3)]
     pools = {"all": DifficultyPoolConfig(threshold=1.0, weight=1.0)}

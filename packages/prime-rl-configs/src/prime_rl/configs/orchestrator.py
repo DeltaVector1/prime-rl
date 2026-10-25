@@ -232,6 +232,12 @@ class TrainSourceConfig(EnvConfig):
     ratio: float = Field(1.0, gt=0)
     """Sampling weight for this environment in the buffer. Relative weights are normalized to probabilities across envs (e.g. [1, 1] and [0.5, 0.5] are equivalent). Defaults to 1, i.e. equal weight per env."""
 
+    max_outstanding: int | None = Field(None, ge=1)
+    """Maximum dispatched train episodes for this source, including env worker queue time.
+    None uses only the shared concurrency limit. At the limit, new tasks are sampled
+    among other sources by their relative weights, which changes the dispatch mix.
+    A group can dispatch in parts when this limit is smaller than its group size."""
+
     group_size: int = Field(1, ge=1)
     """Rollouts generated per example for GRPO group-relative advantages. Overrides the
     train group's ``group_size`` for this env, so envs can use different sizes."""
