@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "preconditions": {
+    "native_worktree": "/tmp/prime-rl-router-auth-20261026",
+    "native_branch": "fix/h100-router-auth",
+    "native_base_commit": "7e910765e62656e3b3dee7bd88d20ef75be0e7ed",
+    "native_base_clean": true,
+    "router_repository": "https://github.com/PrimeIntellect-ai/router.git",
+    "router_source_worktree": "/tmp/prime-router-auth-source-20261026",
+    "router_source_commit": "3655104fd1585ccab13357b55e55202cb10fbf73",
+    "router_cargo_lock_sha256": "bffaef7dd68728c50959c54ec94aaa35c2a8778480c0a733a5f51589dfc064a1",
+    "router_source_files_sha256": {
+      "src/core/worker.rs": "9c5e7aac95bf9b313ca4d7a455165131dba184ef15389cf1066415ba8d8e8796",
+      "setup.py": "ba9fcb8f70f279022b7e724c737eb19f34fcebeffb4ebd4592e91ed85ac59791"
+    }
+  },
+  "patch": {
+    "path": "router-auth.patch",
+    "sha256": "9ff9f8e046c8cdcab9b9925e852099123879688db55511f76e3129b87e3ebf2e",
+    "upstream_base_commit": "3655104fd1585ccab13357b55e55202cb10fbf73",
+    "changed_upstream_files": [
+      "setup.py",
+      "src/core/worker.rs"
+    ],
+    "patched_source_files_sha256": {
+      "src/core/worker.rs": "0b3580cab105e22b683cde2b07957ae7872f01874f6a30f5eb88cb81184ca552",
+      "setup.py": "b15fef857c55b6be5043a7e7b1e7889f4aaba0597dca8537b024d1b465c83c7f"
+    }
+  },
+  "toolchain": {
+    "rust": "1.95.0",
+    "rustfmt_toolchain": "1.95.0",
+    "python": ">=3.9",
+    "python_packages": [
+      "setuptools==80.9.0",
+      "wheel==0.45.1",
+      "setuptools-rust==1.12.0",
+      "build==1.3.0",
+      "semantic-version==2.10.0",
+      "packaging==26.3",
+      "pyproject-hooks==1.3.3"
+    ],
+    "system_build_requirements": [
+      "pkg-config",
+      "OpenSSL development headers and libraries",
+      "cmake",
+      "C compiler",
+      "C++ compiler"
+    ]
+  },
+  "commands": {
+    "install_python_build_requirements": "python -m pip install setuptools==80.9.0 wheel==0.45.1 setuptools-rust==1.12.0 build==1.3.0 semantic-version==2.10.0 packaging==26.3 pyproject-hooks==1.3.3",
+    "format_check": "cargo fmt --all --check",
+    "focused_test": "cargo test --locked --lib models_request",
+    "wheel_build": "python -m build --wheel --no-isolation",
+    "lock_enforcement": "RustExtension cargo_manifest_args=[\"--locked\"]",
+    "apply_patch": "git apply router-auth.patch"
+  },
+  "checks": {
+    "source_format_check": "passed with local rustfmt 1.84.1",
+    "source_diff_check": "passed",
+    "patch_apply_check": "passed with git apply --cached --check against the clean router source index",
+    "focused_test": {
+      "result": "blocked before compilation",
+      "local_rust": "rustc 1.84.1; cargo 1.84.1",
+      "detail": "getrandom 0.4.2 requires Cargo edition2024 support; use required Rust/Cargo 1.95.0"
+    },
+    "wheel_build": "not run; assigned to the H100 operator after review"
+  }
+}
