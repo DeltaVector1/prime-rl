@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import torch.nn as nn
@@ -5,7 +6,7 @@ from torch.distributed.tensor import DTensor
 
 from prime_rl.configs.shared import FileSystemWeightBroadcastConfig
 from prime_rl.configs.trainer import LoRAConfig
-from prime_rl.orchestrator.clients import load_lora_adapter
+from prime_rl.orchestrator.clients import load_lora_adapter, stage_lora_adapter
 from prime_rl.trainer.lora import get_lora_state, save_lora_config
 from prime_rl.transports.weights.base import FINISHED_MARKER, WeightReceiver, WeightSender
 from prime_rl.utils.pathing import wait_for_path
@@ -65,10 +66,24 @@ class FileSystemWeightReceiver(WeightReceiver):
     no engine pause; a full checkpoint pauses the engines for the load."""
 
     async def receive(self, step: int) -> None:
+        self.admin_plane.update_times = {}
         weights_dir = self.step_dir(step)
         self._ack(step)
         await wait_for_path(weights_dir / FINISHED_MARKER)
         if (weights_dir / "adapter_config.json").exists():
-            await load_lora_adapter(self.admin_plane, self.model_name, weights_dir)
+            if self.admin_plane.stage_clients:
+                started = time.perf_counter()
+                try:
+                    await stage_lora_adapter(self.admin_plane, weights_dir, self.config.timeout)
+                finally:
+                    self.admin_plane.update_times = {"adapter_stage": [time.perf_counter() - started]}
+            started = time.perf_counter()
+            try:
+                await load_lora_adapter(self.admin_plane, self.model_name, weights_dir)
+            finally:
+                self.admin_plane.update_times = {
+                    **self.admin_plane.update_times,
+                    "adapter_load": [time.perf_counter() - started],
+                }
         else:
             await self.admin_plane.update_weights(weights_dir, transport="filesystem", step=step)

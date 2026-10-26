@@ -2,6 +2,7 @@ import os
 import re
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
+from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, Field, model_validator
 from verifiers.v1.configs.client import BaseClientConfig
@@ -234,6 +235,27 @@ class ClientConfig(BaseClientConfig):
 
     admin_base_url: list[str] | None = None
     """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in multi-replica or disaggregated P/D deployments where the router must not handle admin traffic."""
+
+    stage_base_url: list[str] = Field(default_factory=list)
+    """Adapter staging proxy roots, one per remote filesystem host. Empty uses the local filesystem only."""
+
+    @model_validator(mode="after")
+    def validate_stage_urls(self):
+        for value in self.stage_base_url:
+            url = urlsplit(value)
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.hostname
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+                or url.path not in {"", "/"}
+            ):
+                raise ValueError("stage_base_url must contain HTTP origins without credentials")
+        if len({value.rstrip("/") for value in self.stage_base_url}) != len(self.stage_base_url):
+            raise ValueError("stage_base_url must not contain duplicates")
+        return self
 
 
 class VLLMClientConfig(ClientConfig):

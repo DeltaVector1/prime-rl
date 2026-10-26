@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -116,12 +117,20 @@ class AdminPlane:
     roles: list[str | None] | None = None
     """P/D role of each client, in client order. Prefill engines pause before decode engines."""
 
+    stage_clients: list[AsyncClient] = []
+    """Remote adapter hosts. Subclasses without remote staging keep this empty."""
+
     # Per-engine times of the last update_weights phases (pause, transfer, resume).
     # Replaced, never mutated.
     update_times: dict[str, list[float]] = {}
 
     def __init__(self, client_config: ClientConfig, roles: list[str | None] | None = None):
         self.clients = setup_admin_clients(client_config)
+        self.stage_clients = (
+            setup_admin_clients(client_config.model_copy(update={"admin_base_url": client_config.stage_base_url}))
+            if client_config.stage_base_url
+            else []
+        )
         self.roles = roles
         # When admin URLs bypass a router, also health-check the client-facing
         # (router) endpoint - it only starts serving once its workers are healthy.
@@ -210,7 +219,7 @@ class AdminPlane:
         self.update_times = {"pause": pause_times, "transfer": transfer_times, "resume": resume_times}
 
     async def aclose(self) -> None:
-        for client in self.clients + self._router_clients:
+        for client in self.clients + self._router_clients + self.stage_clients:
             await client.aclose()
 
 
@@ -473,6 +482,70 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 # stop condition fires first.
 LORA_LOAD_READ_TIMEOUT_S = 30.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 120.0
+
+
+async def stage_lora_adapter(admin_plane: AdminPlane, lora_path: Path, timeout: float) -> None:
+    """Stage one verified adapter per remote host before the native load budget starts."""
+    if not admin_plane.stage_clients:
+        return
+
+    def endpoint(client: AsyncClient) -> str:
+        url = client.base_url
+        return str(httpx.URL(scheme=url.scheme, host=url.host, port=url.port))
+
+    async def stage(client: AsyncClient) -> dict:
+        try:
+            response = await client.post(
+                "/stage_lora_adapter",
+                json={"lora_path": lora_path.as_posix()},
+                timeout=httpx.Timeout(connect=10.0, read=timeout, write=60.0, pool=10.0),
+            )
+            response.raise_for_status()
+            manifest = response.json()
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("path") != lora_path.as_posix()
+                or not isinstance(manifest.get("files"), dict)
+                or set(manifest["files"]) != {"adapter_config.json", "adapter_model.safetensors", ".finished"}
+            ):
+                raise ValueError("invalid staging receipt")
+            for record in manifest["files"].values():
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"size", "sha256"}
+                    or type(record["size"]) is not int
+                    or record["size"] < 0
+                    or not isinstance(record["sha256"], str)
+                    or not re.fullmatch("[0-9a-f]{64}", record["sha256"])
+                ):
+                    raise ValueError("invalid staging file record")
+            return manifest
+        except httpx.HTTPStatusError as error:
+            raise RuntimeError(
+                f"Adapter staging failed at {endpoint(client)}: HTTP {error.response.status_code}"
+            ) from None
+        except (httpx.HTTPError, ValueError) as error:
+            raise RuntimeError(f"Adapter staging failed at {endpoint(client)}: {type(error).__name__}") from None
+
+    tasks = [asyncio.create_task(stage(client)) for client in admin_plane.stage_clients]
+    try:
+        async with asyncio.timeout(timeout):
+            manifests = await asyncio.gather(*tasks)
+        for client, manifest in zip(admin_plane.stage_clients[1:], manifests[1:]):
+            if manifest != manifests[0]:
+                raise RuntimeError(f"Adapter staging manifest differs at {endpoint(client)}")
+    except TimeoutError as error:
+        pending = [
+            endpoint(client)
+            for client, task in zip(admin_plane.stage_clients, tasks)
+            if task.cancelled() or not task.done()
+        ]
+        raise TimeoutError(f"Adapter staging exceeded {timeout}s at {', '.join(pending)}") from error
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def load_lora_adapter(admin_plane: AdminPlane, lora_name: str, lora_path: Path) -> None:
