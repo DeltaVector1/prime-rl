@@ -29,6 +29,8 @@
   },
   "toolchain": {
     "rust": "1.95.0",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
     "rustfmt_toolchain": "1.95.0",
     "python": ">=3.9",
     "python_packages": [
@@ -57,14 +59,103 @@
     "apply_patch": "git apply router-auth.patch"
   },
   "checks": {
-    "source_format_check": "passed with local rustfmt 1.84.1",
+    "source_format_check": {
+      "status": "passed",
+      "command": ["cargo", "fmt", "--all", "--check"],
+      "seconds": 0.7569605039898306,
+      "completed_utc": "2026-10-26T05:07:06.690508+00:00"
+    },
     "source_diff_check": "passed",
     "patch_apply_check": "passed with git apply --cached --check against the clean router source index",
     "focused_test": {
-      "result": "blocked before compilation",
-      "local_rust": "rustc 1.84.1; cargo 1.84.1",
-      "detail": "getrandom 0.4.2 requires Cargo edition2024 support; use required Rust/Cargo 1.95.0"
+      "status": "passed on H100",
+      "command": ["cargo", "test", "--locked", "--lib", "models_request"],
+      "initial_build_failure": {
+        "reason": "The extracted OpenSSL multiarch header was missing from the include path.",
+        "seconds": 48.65476107294671,
+        "completed_utc": "2026-10-26T05:07:55.346919+00:00"
+      },
+      "build_environment_repair": "Added the extracted OpenSSL multiarch header directory to CPATH.",
+      "retry": {
+        "status": "passed",
+        "seconds": 63.689203538000584,
+        "completed_utc": "2026-10-26T05:09:33.347122+00:00",
+        "tests_passed": 2,
+        "tests_failed": 0,
+        "test_harness_seconds": 0.08,
+        "test_names": [
+          "test core::worker::tests::models_request_adds_sensitive_bearer_authorization ... ok",
+          "test core::worker::tests::models_request_omits_authorization_without_a_nonempty_key ... ok"
+        ]
+      }
     },
-    "wheel_build": "not run; assigned to the H100 operator after review"
+    "wheel_build": {
+      "status": "passed on H100",
+      "command": [
+        "/root/glm52-rl/setup/router-auth-build-20261026/build-venv/bin/python",
+        "-m",
+        "build",
+        "--wheel",
+        "--no-isolation"
+      ],
+      "seconds": 215.4455044490751,
+      "completed_utc": "2026-10-26T05:13:08.794806+00:00",
+      "python_version": "Python 3.12.3",
+      "build_python_packages": [
+        "build==1.3.0",
+        "packaging==26.3",
+        "pip==24.0",
+        "pyproject_hooks==1.3.3",
+        "semantic-version==2.10.0",
+        "setuptools==80.9.0",
+        "setuptools-rust==1.12.0",
+        "wheel==0.45.1"
+      ],
+      "wheel": {
+        "name": "vllm_router-0.2.3-cp38-abi3-linux_x86_64.whl",
+        "path": "/root/glm52-rl/setup/router-auth-build-20261026/router-source/dist/vllm_router-0.2.3-cp38-abi3-linux_x86_64.whl",
+        "package_version": "0.2.3",
+        "bytes": 8816708,
+        "sha256": "5fcb775b8c6a4eb8bcb62b9e79cdc6e2861fa21edccbd366932e887e3921cc60",
+        "tag": "cp38-abi3-linux_x86_64",
+        "entry_point": "vllm-router = vllm_router.launch_router:main"
+      },
+      "native_extension": {
+        "wheel_member": "vllm_router_rs.abi3.so",
+        "bytes": 23256336,
+        "sha256": "7ad91b5561eac7022e14b7a14475383ecabd0a2e3da560b7aa722f1bb09df1a4"
+      },
+      "python_package_sha256": {
+        "vllm_router/__init__.py": "062a5823bd4089b527f78921b841648241bef781125de4828fe53335a67e6df6",
+        "vllm_router/launch_router.py": "b934b43bb97d332468f0d6e6b0b1c1143bf9b5d60e2e09d3f12948e1c1f85dd3",
+        "vllm_router/mini_lb.py": "f0e8fddcadbcafd5bc1be8f677ff7df259237ff16b40c714954faf7ca8f651ca",
+        "vllm_router/router.py": "98c5273e5400f1263036b46b139ab70c1306505438d026bb317ee3972cb74474",
+        "vllm_router/router_args.py": "95fc979ed5beaffe12256d0ac26b6a9cb2492f642230f8fd8d3492cbbf9662ce",
+        "vllm_router/version.py": "3cd883111e2a335f61f7376c75f80ab76fdd4f85a060aec482e27c454daa03f8"
+      },
+      "isolated_import": {
+        "status": "passed",
+        "python_version": "Python 3.12.3",
+        "removed_environment_variables": ["LD_LIBRARY_PATH", "PYTHONPATH"]
+      },
+      "system_library_requirements": [
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libc.so.6",
+        "/lib64/ld-linux-x86-64.so.2"
+      ]
+    },
+    "local_attempt": {
+      "focused_test": {
+        "result": "blocked before compilation",
+        "local_rust": "rustc 1.84.1; cargo 1.84.1",
+        "detail": "getrandom 0.4.2 requires Cargo edition2024 support."
+      }
+    },
+    "h100_artifact_receipt": {
+      "started_utc": "2026-10-26T05:07:05.932875+00:00",
+      "sha256": "c86e7072e416fe95b671b69538840f65a035b865920b7307925180d11bda09eb"
+    }
   }
 }
