@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "native_base_commit": "2b7f17936f7e4a1e2b1405bb74085ded5af2872c",
+  "native_branch": "fix/router-send-diagnostics-20261027",
+  "router_base_commit": "3655104fd1585ccab13357b55e55202cb10fbf73",
+  "router_source_worktree": "/tmp/prime-router-send-diagnostics-20261027",
+  "patch": {
+    "path": "router-send-diagnostics.patch",
+    "sha256": "a9575b32ba6cd637dab52d3d1c64d9d3198285bffe421a9d0b295eb9335f794f",
+    "bytes": 11048,
+    "changed_upstream_files": [
+      "src/routers/http/router.rs"
+    ],
+    "source_sha256": "98b786343785606ce0d705d6dd2b06f63d6b198f4224f5ef9ff1f1aea8ed180d",
+    "base_source_sha256": "e71b047c3954fdefc910b4dd0525f24f2d3d250548fcf24e0ed0dd52ef136ff4"
+  },
+  "prerequisite_auth_patch": {
+    "path": "router-auth.patch",
+    "sha256": "9ff9f8e046c8cdcab9b9925e852099123879688db55511f76e3129b87e3ebf2e"
+  },
+  "preserved_auth_metadata_sha256": "adac93c636ea7864b0908f5fd0dd3e7c5fbda1d166949100bdf0b14fb784e441",
+  "preserved_auth_artifact_receipt_sha256": "c86e7072e416fe95b671b69538840f65a035b865920b7307925180d11bda09eb",
+  "preserved_source_sha256": {
+    "setup.py": "b15fef857c55b6be5043a7e7b1e7889f4aaba0597dca8537b024d1b465c83c7f",
+    "src/core/worker.rs": "0b3580cab105e22b683cde2b07957ae7872f01874f6a30f5eb88cb81184ca552",
+    "Cargo.lock": "bffaef7dd68728c50959c54ec94aaa35c2a8778480c0a733a5f51589dfc064a1"
+  },
+  "diagnostics": {
+    "cause_depth_limit": 8,
+    "source_text_inspection_bytes_limit": 256,
+    "worker_origin_char_limit": 256,
+    "source_text_logged": false,
+    "unknown_source_label": "unclassified",
+    "cause_fields": [
+      "fixed_label",
+      "io_error_kind",
+      "raw_os_error"
+    ],
+    "event_fields": [
+      "worker_origin",
+      "error_class",
+      "is_connect",
+      "is_timeout",
+      "error_causes",
+      "causes_truncated",
+      "send_elapsed_ms"
+    ],
+    "timing": "Monotonic time from immediately before send_client_request until the error branch, including tracing setup and upstream response header wait. Excludes response body reads and retry backoff.",
+    "behavior_changes": []
+  },
+  "checks": {
+    "standalone_source_tests": {
+      "status": "passed",
+      "tests_passed": 3,
+      "tests_failed": 0,
+      "compile_seconds": 0.9044884389732033,
+      "test_seconds": 0.003938294947147369,
+      "coverage": [
+        "local_refused_connection_io_error",
+        "closed_connection_fixed_label",
+        "deep_chain_limit",
+        "large_secret_source_text_exclusion",
+        "custom_io_error_secret_exclusion"
+      ]
+    },
+    "cargo_format": {
+      "status": "passed",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ]
+    },
+    "source_diff": {
+      "status": "passed",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ]
+    },
+    "full_source_tests": {
+      "status": "blocked_before_compilation",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--lib",
+        "send_error_diagnostics"
+      ],
+      "returncode": 101,
+      "reason": "Missing cached anes v0.1.6.",
+      "pending_test": "send_error_diagnostics_typed_request_log",
+      "toolchain": "rustc 1.84.1; cargo 1.84.1",
+      "required_toolchain_from_auth_receipt": "1.95.0"
+    },
+    "wheel_build": {
+      "status": "not_run",
+      "reason": "Local build dependency and toolchain blockers."
+    },
+    "independent_review": {
+      "status": "pending"
+    },
+    "bundle_check": {
+      "status": "passed",
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "python",
+        "patches/trinity-mixed/router/check_send_diagnostics.py",
+        "/tmp/prime-router-send-diagnostics-20261027"
+      ],
+      "compile_seconds": 0.3924705450190231,
+      "test_seconds": 0.004020651918835938,
+      "tests_passed": 3,
+      "patch_apply": "auth and diagnostics patches applied to clean source fixture",
+      "source_hashes": "matched",
+      "script_sha256": "29df4a8c3e024d0c7960d9d113b4b73602d5c7bd72eda60ae216efb4a596941c"
+    }
+  },
+  "live_hosts_contacted": [],
+  "next_check_commands": [
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "--lib",
+      "send_error_diagnostics"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "--lib",
+      "models_request"
+    ]
+  ]
+}

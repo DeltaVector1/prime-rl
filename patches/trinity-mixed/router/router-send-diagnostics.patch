@@ -1,0 +1,295 @@
+diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
+index 71635b4..eada09f 100644
+--- a/src/routers/http/router.rs
++++ b/src/routers/http/router.rs
+@@ -34,6 +34,103 @@ use std::time::{Duration, Instant};
+ use tokio_stream::wrappers::UnboundedReceiverStream;
+ use tracing::{debug, error, info, warn};
+
++fn send_error_class(error: &reqwest::Error) -> &'static str {
++    if error.is_timeout() {
++        "timeout"
++    } else if error.is_connect() {
++        "connect"
++    } else if error.is_builder() {
++        "builder"
++    } else if error.is_redirect() {
++        "redirect"
++    } else if error.is_body() {
++        "body"
++    } else if error.is_decode() {
++        "decode"
++    } else if error.is_request() {
++        "request"
++    } else {
++        "other"
++    }
++}
++
++// Limit both traversal and formatting. Unknown source text can contain request data.
++fn send_error_causes(error: &(dyn std::error::Error + 'static)) -> (String, bool) {
++    use std::fmt::Write;
++
++    struct CauseText(String);
++    impl std::fmt::Write for CauseText {
++        fn write_str(&mut self, value: &str) -> std::fmt::Result {
++            if self.0.len() + value.len() > 256 {
++                return Err(std::fmt::Error);
++            }
++            self.0.push_str(value);
++            Ok(())
++        }
++    }
++
++    let mut causes = String::new();
++    let mut source = error.source();
++    for _ in 0..8 {
++        let Some(cause) = source else { break };
++        if !causes.is_empty() {
++            causes.push_str(" -> ");
++        }
++        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
++            // ErrorKind and the OS code contain no custom error message.
++            write!(causes, "io:{:?}:os={:?}", io.kind(), io.raw_os_error()).unwrap();
++        } else {
++            let mut text = CauseText(String::new());
++            let complete = write!(text, "{cause}").is_ok();
++            let label = if complete {
++                match text.0.as_str() {
++                    "connection closed before message completed" => "incomplete_message",
++                    "operation was canceled" | "operation canceled" => "canceled",
++                    "channel closed" => "channel_closed",
++                    "connection error" => "connection_error",
++                    "client error (Connect)" | "tcp connect error" => "connect",
++                    "operation timed out" => "timeout",
++                    "http2 error" => "http2",
++                    value if value.starts_with("dns error") => "dns",
++                    value if value.starts_with("invalid peer certificate") => "tls_certificate",
++                    _ => "unclassified",
++                }
++            } else {
++                "unclassified"
++            };
++            causes.push_str(label);
++        }
++        source = cause.source();
++    }
++    (causes, source.is_some())
++}
++
++fn send_error_worker_origin(worker_url: &str) -> String {
++    reqwest::Url::parse(worker_url)
++        .map(|url| {
++            url.origin()
++                .ascii_serialization()
++                .chars()
++                .take(256)
++                .collect()
++        })
++        .unwrap_or_else(|_| "invalid_url".to_string())
++}
++
++fn log_typed_send_error(error: &reqwest::Error, worker_url: &str, elapsed: Duration) {
++    let (causes, causes_truncated) = send_error_causes(error);
++    error!(
++        worker_origin = %send_error_worker_origin(worker_url),
++        error_class = send_error_class(error),
++        is_connect = error.is_connect(),
++        is_timeout = error.is_timeout(),
++        error_causes = %causes,
++        causes_truncated,
++        send_elapsed_ms = elapsed.as_secs_f64() * 1000.0,
++        "Failed to send typed request"
++    );
++}
++
+ /// Regular router that uses injected load balancing policies
+ #[derive(Debug)]
+ pub struct Router {
+@@ -929,6 +1026,7 @@ impl Router {
+             request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
+         }
+
++        let send_started = Instant::now();
+         let res = match otel_http::send_client_request(
+             request_builder,
+             headers,
+@@ -943,10 +1041,7 @@ impl Router {
+         {
+             Ok(res) => res,
+             Err(e) => {
+-                error!(
+-                    "Failed to send typed request worker_url={} route={} error={}",
+-                    worker_url, route, e
+-                );
++                log_typed_send_error(&e, worker_url, send_started.elapsed());
+
+                 // Decrement load on error if it was incremented
+                 if load_incremented {
+@@ -2118,6 +2213,166 @@ mod tests {
+     use super::*;
+     use std::collections::HashMap;
+
++    mod send_error_diagnostics {
++        use super::send_error_causes;
++
++        #[derive(Debug)]
++        struct Source {
++            message: String,
++            next: Option<Box<dyn std::error::Error>>,
++        }
++
++        impl std::fmt::Display for Source {
++            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                f.write_str(&self.message)
++            }
++        }
++
++        impl std::error::Error for Source {
++            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++                self.next.as_deref()
++            }
++        }
++
++        #[test]
++        fn refused_connection_has_io_cause() {
++            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++            let address = listener.local_addr().unwrap();
++            drop(listener);
++            let error =
++                std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(1))
++                    .unwrap_err();
++            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
++            let wrapped = Source {
++                message: "https://user:credential@host/?token=secret".into(),
++                next: Some(Box::new(error)),
++            };
++            let (causes, truncated) = send_error_causes(&wrapped);
++            assert!(causes.contains("io:ConnectionRefused:os=Some("), "{causes}");
++            assert!(causes.len() < 128);
++            assert!(!truncated);
++            assert!(!causes.contains("secret"));
++            assert!(!causes.contains("credential"));
++        }
++
++        #[test]
++        fn closed_connection_has_fixed_label() {
++            let error = Source {
++                message: "request body secret".into(),
++                next: Some(Box::new(Source {
++                    message: "connection closed before message completed".into(),
++                    next: None,
++                })),
++            };
++            assert_eq!(
++                send_error_causes(&error),
++                ("incomplete_message".into(), false)
++            );
++        }
++
++        #[test]
++        fn unknown_and_deep_causes_are_bounded_and_private() {
++            let mut error = Source {
++                message: "request body secret".repeat(10_000),
++                next: None,
++            };
++            for _ in 0..20 {
++                error = Source {
++                    message: "Authorization: Bearer credential\nCookie: secret".repeat(1_000),
++                    next: Some(Box::new(error)),
++                };
++            }
++            let (causes, truncated) = send_error_causes(&error);
++            assert_eq!(causes, ["unclassified"; 8].join(" -> "));
++            assert!(truncated);
++            assert!(causes.len() <= 1024);
++
++            let io = Source {
++                message: "outer".into(),
++                next: Some(Box::new(std::io::Error::new(
++                    std::io::ErrorKind::Other,
++                    "Authorization: Bearer credential",
++                ))),
++            };
++            assert_eq!(send_error_causes(&io), ("io:Other:os=None".into(), false));
++        }
++    }
++
++    #[tokio::test(flavor = "current_thread")]
++    async fn send_error_diagnostics_typed_request_log() {
++        #[derive(Clone)]
++        struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
++        impl std::io::Write for LogSink {
++            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++                self.0.lock().unwrap().extend_from_slice(bytes);
++                Ok(bytes.len())
++            }
++            fn flush(&mut self) -> std::io::Result<()> {
++                Ok(())
++            }
++        }
++
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = listener.local_addr().unwrap();
++        drop(listener);
++        let worker_url = format!("http://url_user:url_password@{address}");
++        let route = "/v1/completions?token=query_secret";
++        let mut headers = HeaderMap::new();
++        headers.insert(
++            "authorization",
++            HeaderValue::from_static("Bearer header_secret"),
++        );
++        headers.insert("cookie", HeaderValue::from_static("session=cookie_secret"));
++        let request = serde_json::json!({"prompt": "body_secret"});
++        let mut router = create_test_regular_router();
++        router.client = Client::builder()
++            .no_proxy()
++            .timeout(Duration::from_secs(1))
++            .build()
++            .unwrap();
++        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
++        let sink = LogSink(logs.clone());
++        let subscriber = tracing_subscriber::fmt()
++            .with_writer(move || sink.clone())
++            .with_ansi(false)
++            .without_time()
++            .with_max_level(tracing::Level::ERROR)
++            .finish();
++        let _guard = tracing::subscriber::set_default(subscriber);
++        let response = router
++            .send_typed_request(
++                Some(&headers),
++                &request,
++                route,
++                &worker_url,
++                false,
++                false,
++                None,
++            )
++            .await;
++        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
++        let body = to_bytes(response.into_body(), 4096).await.unwrap();
++        assert!(std::str::from_utf8(&body)
++            .unwrap()
++            .starts_with("Request failed: "));
++        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
++        assert!(logs.contains("Failed to send typed request"), "{logs}");
++        assert!(logs.contains("error_class=\"connect\""), "{logs}");
++        assert!(logs.contains("io:ConnectionRefused:os=Some("), "{logs}");
++        assert!(logs.contains("send_elapsed_ms="), "{logs}");
++        assert!(logs.len() <= 2048, "{}", logs.len());
++        for secret in [
++            "url_user",
++            "url_password",
++            "query_secret",
++            "header_secret",
++            "cookie_secret",
++            "body_secret",
++        ] {
++            assert!(!logs.contains(secret), "{logs}");
++        }
++    }
++
+     #[test]
+     fn test_is_vllm_input_validation_error() {
+         // Prompt too long error from vLLM
