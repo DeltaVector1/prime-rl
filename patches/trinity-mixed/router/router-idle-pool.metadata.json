@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "native_base_commit": "e27bf8315e348630836f50e6ed1aa2419dff94f5",
+  "native_branch": "fix/router-idle-pool-20261027",
+  "router_base_commit": "3655104fd1585ccab13357b55e55202cb10fbf73",
+  "router_source_worktree": "/tmp/prime-router-idle-pool-20261027",
+  "patch": {
+    "path": "router-idle-pool.patch",
+    "sha256": "87a3d84eccbadb6d1309f75c24b8405decd01b7060fc33ba59a6d02338613b84",
+    "bytes": 578,
+    "changed_upstream_files": [
+      "src/server.rs"
+    ],
+    "base_source_sha256": "1f16891adeaff516704ec2a539fe0c241e93ff6eec9fc1b026ea15e6b6544c8e",
+    "source_sha256": "b8a07f44c497dd199be15b1ac26da3edb991ae43f072cca2c3f6a72b8405f1e5"
+  },
+  "prerequisite_patches": [
+    "router-auth.patch",
+    "router-send-diagnostics.patch"
+  ],
+  "preserved_bundle_sha256": {
+    "router-auth.patch": "9ff9f8e046c8cdcab9b9925e852099123879688db55511f76e3129b87e3ebf2e",
+    "metadata.json": "adac93c636ea7864b0908f5fd0dd3e7c5fbda1d166949100bdf0b14fb784e441",
+    "router-send-diagnostics.patch": "a9575b32ba6cd637dab52d3d1c64d9d3198285bffe421a9d0b295eb9335f794f",
+    "router-send-diagnostics.metadata.json": "2d1540ab277797e3ffeb3caa7b09fb503fd8bd72baa5704ef6c8e019e5094d41",
+    "check_send_diagnostics.py": "29df4a8c3e024d0c7960d9d113b4b73602d5c7bd72eda60ae216efb4a596941c"
+  },
+  "preserved_auth_artifact_receipt_sha256": "c86e7072e416fe95b671b69538840f65a035b865920b7307925180d11bda09eb",
+  "preserved_source_sha256": {
+    "setup.py": "b15fef857c55b6be5043a7e7b1e7889f4aaba0597dca8537b024d1b465c83c7f",
+    "src/core/worker.rs": "0b3580cab105e22b683cde2b07957ae7872f01874f6a30f5eb88cb81184ca552",
+    "src/routers/http/router.rs": "98b786343785606ce0d705d6dd2b06f63d6b198f4224f5ef9ff1f1aea8ed180d",
+    "Cargo.lock": "bffaef7dd68728c50959c54ec94aaa35c2a8778480c0a733a5f51589dfc064a1"
+  },
+  "transport_change": {
+    "pool_max_idle_per_host": {
+      "before": 500,
+      "after": 0
+    },
+    "preserved_settings": {
+      "pool_idle_timeout_secs": 50,
+      "request_timeout": "config.request_timeout_secs",
+      "connect_timeout_secs": 10,
+      "tcp_nodelay": true,
+      "tcp_keepalive_secs": 30
+    },
+    "scope": "Shared forwarding client idle connection retention."
+  },
+  "checks": {
+    "bundle_check": {
+      "status": "passed",
+      "seconds": 0.22443531395401806,
+      "network_guard": "training_ops.tests.network_guard.install",
+      "coverage": [
+        "prerequisite_patch_hashes",
+        "preserved_bundle_hashes",
+        "patch_apply_to_clean_base",
+        "single_setting_source_diff",
+        "preserved_source_hashes",
+        "exact_baseline_and_candidate_client_extraction",
+        "rustfmt_parses_generated_fixture"
+      ],
+      "script_sha256": "6542e12fac7e10dd76bbbf61e69859c94e4ede13fd5d73e46f2f85c51560862a"
+    },
+    "http_fixture": {
+      "status": "blocked_before_compilation",
+      "test": "idle_pool_connection_counts",
+      "baseline_requests": 2,
+      "baseline_connections": 1,
+      "candidate_requests": 2,
+      "candidate_connections": 2,
+      "server": "Disposable loopback HTTP/1.1 server with persistent responses.",
+      "client_builders": "Extracted unchanged from baseline and patched src/server.rs.",
+      "fixture_outer_limit_secs": 5,
+      "fixture_request_timeout_secs": 14400,
+      "proxy_environment": "Removed proxy variables; NO_PROXY=* and no_proxy=* for the fixture child.",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--example",
+        "router_idle_pool_check",
+        "--no-run"
+      ],
+      "seconds": 0.35332415893208236,
+      "returncode": 101,
+      "reason": "Missing cached anes v0.1.6.",
+      "toolchain": "rustc 1.84.1; cargo 1.84.1",
+      "required_toolchain_from_auth_receipt": "1.95.0",
+      "local_network_guard": "Blocks all connect syscalls, including loopback. Private network namespace creation was also denied."
+    },
+    "independent_review": {
+      "status": "pending"
+    },
+    "wheel_build": {
+      "status": "not_run",
+      "reason": "Local dependency cache and toolchain do not support the locked build."
+    },
+    "cargo_format": {
+      "status": "passed",
+      "seconds": 1.065999296028167,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ]
+    },
+    "source_diff": {
+      "status": "passed",
+      "seconds": 0.010236529051326215,
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ]
+    }
+  },
+  "live_hosts_contacted": [],
+  "next_check_commands": [
+    [
+      "uv",
+      "run",
+      "--no-project",
+      "python",
+      "patches/trinity-mixed/router/check_idle_pool.py",
+      "/tmp/prime-router-idle-pool-20261027",
+      "--http-check"
+    ]
+  ]
+}
