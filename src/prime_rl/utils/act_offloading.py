@@ -113,8 +113,7 @@ class OffloadActivations(saved_tensors_hooks):
             return x.element_size() * x.nelement()  # x.element_size() * x._base_storage().nbytes()
 
         # -------- core pack / unpack work -------- #
-        def pack_tensor(activation: torch.Tensor) -> int:
-            # activations are passed in during forward pass - from here we take over and return a unique id
+        def pack_tensor(activation: torch.Tensor) -> int | tuple[torch.Tensor, bool]:
             if self.is_first_forward_call:
                 assert len(self.tracker) == 0, "backward pass should have cleared tracker of all tensors"
 
@@ -173,11 +172,13 @@ class OffloadActivations(saved_tensors_hooks):
                     False,
                 )  # False = not modified, tensor is as is
 
-            return tensor_id
+            if self.use_streams:
+                return tensor_id
+            # Let autograd own each saved tensor, including tensors never unpacked.
+            saved_tensor, modified = self.tracker.pop(tensor_id)
+            return saved_tensor.detach(), modified
 
-        def unpack_tensor_single_stream(unpack_tensor_id: int) -> torch.Tensor:
-            # backward pass - we are called with the tensor_id, which
-            # we will use to retrieve the saved/offloaded tensor
+        def unpack_tensor_single_stream(packed_tensor: tuple[torch.Tensor, bool]) -> torch.Tensor:
             if self.is_first_backward_call:
                 if self.is_first_forward_pass:
                     self.is_first_forward_pass = False
@@ -187,15 +188,11 @@ class OffloadActivations(saved_tensors_hooks):
                 self.is_first_backward_call = False
                 self.is_first_forward_call = True
 
-            assert unpack_tensor_id in self.tracker, f"untracked tensor with id {unpack_tensor_id}"
-
-            maybe_gpu_tensor, modified = self.tracker[unpack_tensor_id]
+            maybe_gpu_tensor, modified = packed_tensor
             if modified:
                 gpu_tensor = maybe_gpu_tensor.to(torch.accelerator.current_accelerator(), non_blocking=True)
                 maybe_gpu_tensor = gpu_tensor
 
-            # clear tensor from tracking
-            del self.tracker[unpack_tensor_id]
             return maybe_gpu_tensor
 
         def unpack_tensor_with_streams(unpack_tensor_id: int) -> torch.Tensor:
